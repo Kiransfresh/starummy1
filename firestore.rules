@@ -1,0 +1,83 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function email() {
+      return signedIn() && request.auth.token.email != null
+        ? request.auth.token.email
+        : '';
+    }
+
+    function isOwner() {
+      return email() == 'kvkmsolutions@gmail.com';
+    }
+
+    function adminDoc() {
+      return get(/databases/$(database)/documents/adminAccess/$(email()));
+    }
+
+    function isDelegatedAdmin() {
+      return signedIn()
+        && email() != ''
+        && exists(/databases/$(database)/documents/adminAccess/$(email()))
+        && adminDoc().data.enabled == true;
+    }
+
+    function canApprovePayments() {
+      return isOwner() || (isDelegatedAdmin() && adminDoc().data.permissions.payments == true);
+    }
+
+    function canChangeGameSettings() {
+      return isOwner() || (isDelegatedAdmin() && adminDoc().data.permissions.gameSettings == true);
+    }
+
+    match /adminAccess/{adminEmail} {
+      allow read: if isOwner() || (signedIn() && email() == adminEmail);
+      allow create, update, delete: if isOwner();
+    }
+
+    match /users/{uid} {
+      allow read: if signedIn() && (request.auth.uid == uid || canApprovePayments());
+
+      // A normal user can bootstrap only the standard starter balance.
+      allow create: if signedIn()
+        && request.auth.uid == uid
+        && request.resource.data.coins == 5000;
+
+      // Users may update profile fields, but never their own wallet balance.
+      allow update: if signedIn() && (
+        canApprovePayments()
+        || (
+          request.auth.uid == uid
+          && request.resource.data.coins == resource.data.coins
+        )
+      );
+
+      allow delete: if false;
+    }
+
+    match /walletTopups/{requestId} {
+      allow create: if signedIn()
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.status == 'pending'
+        && request.resource.data.amountRupees is int
+        && request.resource.data.amountRupees >= 10
+        && request.resource.data.amountRupees <= 50000
+        && request.resource.data.credits == request.resource.data.amountRupees * 10;
+
+      allow read: if signedIn()
+        && (resource.data.uid == request.auth.uid || canApprovePayments());
+
+      allow update: if canApprovePayments();
+      allow delete: if false;
+    }
+
+    match /gameSettings/{docId} {
+      allow read: if signedIn();
+      allow write: if canChangeGameSettings();
+    }
+  }
+}

@@ -1,0 +1,51 @@
+STAR RUMMY 101 — FINAL FEATURE PACKAGE
+
+MULTIPLAYER / SOCKET
+- Server-confirmed Create Room and Join Room.
+- Second device can join the same private room code.
+- Stable player identity through reconnects.
+- Polling -> WebSocket upgrade for mobile reliability.
+- 45-second reconnect grace window.
+- Server-authoritative 13 -> draw 14 -> discard 13 turn flow.
+- Two-deck multiplayer support for up to six players.
+
+CARDS / TOUCH / UI
+- One canonical card size per table with 72:100 aspect ratio.
+- Dynamic overlap only; card dimensions do not randomly change within a hand.
+- Single PointerSensor for mouse/touch/stylus to prevent Android WebView double activation.
+- Tap-to-select and drag-to-sort/discard paths separated.
+- Context-menu/long-press interference reduced.
+- Professional card frame/shadow/selection state from previous touch/UI fix retained.
+
+WALLET / UPI GAME CREDITS
+- Wallet screen added.
+- UPI intent receiver: kasturivamsikrishn@ybl.
+- User pays externally through installed UPI app.
+- User returns and submits UPI UTR/reference.
+- Pending request appears live in admin panel.
+- Admin manually verifies and approves/rejects.
+- Approval runs as a Firestore transaction and increments users/{uid}.coins.
+- Player wallet listens live and updates after approval.
+- Global duplicate UTR document ID prevents the same reference being submitted twice.
+- Credits in this build are non-withdrawable in-app game credits only.
+- No cash-out or automated prize payout logic included.
+
+ADMIN SECURITY
+- Owner admin email hard-locked to: kvkmsolutions@gmail.com.
+- Dedicated Firebase Email/Password admin sign-in.
+- Only owner can add, update or revoke delegated admins.
+- Custom delegated permissions:
+  * Payment approvals
+  * Practice/game settings
+- Firestore rules included to protect wallet balances and admin access.
+- Normal users cannot increase their own wallet balance.
+
+BUILD / SECURITY
+- @emotion/is-prop-valid dependency retained.
+- Vite scans only the real root index.html, not stale Capacitor Android output.
+- Old generated Android bundle is intentionally not treated as source.
+- FAST2SMS secret removed from .env because VITE_ secrets are public in compiled apps.
+- .env.example and FINAL_SETUP_README.md included.
+
+IMPORTANT SETUP
+Read FINAL_SETUP_README.md before production use.

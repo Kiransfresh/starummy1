@@ -1,0 +1,15 @@
+node_modules
+dist
+android
+src
+public
+scripts
+*.zip
+*.md
+*.dart
+.env
+.env.*
+package-lock.json
+package.json
+vite.config.js
+capacitor.config.json

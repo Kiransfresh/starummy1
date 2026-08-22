@@ -1,0 +1,51 @@
+STAR RUMMY 101 FINAL QA REPORT
+Generated: 2026-08-22
+
+STATIC SOURCE VALIDATION
+- Parsed 44 JS/JSX files with @babel/parser: PASS
+- JSX parse errors: 0
+- Missing relative imports: 0
+- server.js Node syntax check: PASS
+
+PAYMENT/WALLET QA
+- UPI receiver configured: kasturivamsikrishn@ybl
+- Wallet request requires Firebase-authenticated user: PASS
+- UTR/reference required: PASS
+- Duplicate UTR uses global Firestore document ID: PASS
+- Pending requests live-listen in Admin Panel: PASS (requires Firestore setup/rules deployment)
+- Approval transaction marks request approved + increments user wallet: IMPLEMENTED
+- Previously insecure instant addCoins subscription path removed: PASS
+- User wallet has live Firestore listener after approval: IMPLEMENTED
+- Wallet is non-withdrawable game credits only: ENFORCED BY FEATURE SCOPE
+
+ADMIN QA
+- Owner email: kvkmsolutions@gmail.com
+- Owner hard-coded in app + Firestore security rules: PASS
+- Dedicated Firebase Email/Password admin login: IMPLEMENTED
+- Owner-only grant/revoke admin access: RULES + UI IMPLEMENTED
+- Custom permissions: payment approvals / game settings: IMPLEMENTED
+- Non-admin Main Menu does not expose admin panel button: IMPLEMENTED
+
+CARDS/TOUCH QA
+- Canonical card dimensions per viewport with 72:100 ratio: PASS
+- Only overlap changes to fit 13/14 cards: PASS
+- Removed competing TouchSensor + PointerSensor combination: PASS
+- Single PointerSensor handles mouse/touch/stylus: PASS
+- Tap vs drag threshold retained: PASS
+- Card face pointerEvents none, wrapper owns interactions: PASS
+
+MULTIPLAYER QA
+- Existing server-confirmed create/join/reconnect fixes retained.
+- server.js unchanged from previously tested multiplayer package except packaging/security additions outside server.
+- Two-deck dealing retained.
+- 13 -> draw 14 -> discard 13 server-authoritative flow retained.
+
+BUILD QA
+- Vite root-only dependency discovery retained.
+- @emotion/is-prop-valid in package.json.
+- node_modules intentionally excluded from final ZIP to avoid Windows/Linux native package conflicts.
+- Previous private FAST2SMS VITE key removed from .env.
+- Windows clean build + Capacitor Android sync script retained.
+
+ENVIRONMENT LIMITATION
+- A full Vite bundle was not produced in this Linux session because npm dependency installation timed out and the final ZIP intentionally does not reuse the previously uploaded Windows node_modules. Source-level JSX/import validation passed. Run BUILD_AND_SYNC_NEW_FEATURES_WINDOWS.bat on Windows to install fresh Windows dependencies, build, sync Android assets, and open Android Studio.
