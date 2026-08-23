@@ -1,0 +1,18 @@
+STAR RUMMY LIVE SOCKET CONFIG
+
+Production Socket.IO server:
+https://starummy1-production.up.railway.app
+
+Configured in:
+- .env
+- .env.production
+- src/services/socket.js (production fallback)
+
+Android build commands:
+npm install
+npm run build
+npx cap sync android
+npx cap open android
+
+Do not append /socket.io to VITE_BACKEND_URL.
+Do not change the URL to wss://. Socket.IO handles transport upgrade automatically.

@@ -1,5 +1,5 @@
 {
-  "appId": "com.starrummy.game",
+  "appId": "com.starrummy.app",
   "appName": "Star Rummy",
   "webDir": "dist",
   "android": {
@@ -8,5 +8,10 @@
   },
   "server": {
     "androidScheme": "https"
+  },
+  "plugins": {
+    "FirebaseAuthentication": {
+      "providers": ["google.com", "phone"]
+    }
   }
 }

@@ -1,0 +1,24 @@
+RAILWAY BUILD FIX
+=================
+
+Error fixed:
+COPY src/game/rummyRules.js ./src/game/rummyRules.js -> file not found
+
+What changed:
+1. server.js now contains the required 101-rummy declaration/penalty rules.
+2. Dockerfile no longer copies src/game/rummyRules.js.
+3. Railway backend now requires only:
+   - Dockerfile
+   - server.js
+   - railway-package.json
+
+For the GitHub repo connected to Railway, commit/push at minimum those 3 changed files.
+Then Railway -> Deployments -> Redeploy.
+
+Expected Docker build steps:
+- COPY railway-package.json ./package.json
+- RUN npm install --omit=dev --no-audit --no-fund
+- COPY server.js ./server.js
+- CMD ["node", "server.js"]
+
+There must NOT be a COPY src/game/rummyRules.js line anymore.

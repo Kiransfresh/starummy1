@@ -34,6 +34,35 @@ service cloud.firestore {
       return isOwner() || (isDelegatedAdmin() && adminDoc().data.permissions.gameSettings == true);
     }
 
+    function canViewUserActivity() {
+      return canApprovePayments() || canChangeGameSettings();
+    }
+
+    function validWalletTopup() {
+      return request.resource.data.requestType == 'wallet_topup'
+        && request.resource.data.amountRupees is int
+        && request.resource.data.amountRupees >= 10
+        && request.resource.data.amountRupees <= 50000
+        && request.resource.data.credits == request.resource.data.amountRupees * 10
+        && request.resource.data.planId == '';
+    }
+
+    function validSubscriptionRequest() {
+      return request.resource.data.requestType == 'subscription'
+        && request.resource.data.durationDays == 30
+        && (
+          (request.resource.data.planId == 'basic'
+            && request.resource.data.planName == 'Basic'
+            && request.resource.data.amountRupees == 999
+            && request.resource.data.credits == 6000)
+          ||
+          (request.resource.data.planId == 'pro'
+            && request.resource.data.planName == 'Pro'
+            && request.resource.data.amountRupees == 2000
+            && request.resource.data.credits == 10000)
+        );
+    }
+
     match /adminAccess/{adminEmail} {
       allow read: if isOwner() || (signedIn() && email() == adminEmail);
       allow create, update, delete: if isOwner();
@@ -53,6 +82,9 @@ service cloud.firestore {
         || (
           request.auth.uid == uid
           && request.resource.data.coins == resource.data.coins
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'phone', 'email', 'name', 'avatar', 'updatedAt', 'gamesPlayed', 'gamesWon', 'lastGameResult'
+          ])
         )
       );
 
@@ -63,10 +95,16 @@ service cloud.firestore {
       allow create: if signedIn()
         && request.resource.data.uid == request.auth.uid
         && request.resource.data.status == 'pending'
-        && request.resource.data.amountRupees is int
-        && request.resource.data.amountRupees >= 10
-        && request.resource.data.amountRupees <= 50000
-        && request.resource.data.credits == request.resource.data.amountRupees * 10;
+        && request.resource.data.paymentConfirmed == true
+        && request.resource.data.utr is string
+        && request.resource.data.utr.size() <= 40
+        && request.resource.data.paymentProofDataUrl is string
+        && request.resource.data.paymentProofDataUrl.size() <= 400000
+        && (
+          request.resource.data.paymentProofDataUrl == ''
+          || request.resource.data.paymentProofDataUrl.matches('^data:image/(jpeg|png|webp);base64,.*$')
+        )
+        && (validWalletTopup() || validSubscriptionRequest());
 
       allow read: if signedIn()
         && (resource.data.uid == request.auth.uid || canApprovePayments());
@@ -78,6 +116,25 @@ service cloud.firestore {
     match /gameSettings/{docId} {
       allow read: if signedIn();
       allow write: if canChangeGameSettings();
+    }
+
+    match /activeGames/{uid} {
+      allow read: if signedIn() && (request.auth.uid == uid || canViewUserActivity());
+      allow create, update: if signedIn()
+        && request.auth.uid == uid
+        && request.resource.data.uid == uid;
+      allow delete: if false;
+    }
+
+    match /gameResults/{resultId} {
+      allow read: if signedIn()
+        && (resource.data.uid == request.auth.uid || canViewUserActivity());
+      allow create: if signedIn()
+        && request.resource.data.uid == request.auth.uid;
+      allow update: if signedIn()
+        && resource.data.uid == request.auth.uid
+        && request.resource.data.uid == request.auth.uid;
+      allow delete: if false;
     }
   }
 }

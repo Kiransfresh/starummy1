@@ -8,10 +8,16 @@ echo   STAR RUMMY - NEW FEATURES CLEAN BUILD + ANDROID SYNC
 echo =====================================================
 echo.
 echo Project: %CD%
+echo Live socket: https://starummy1-production.up.railway.app
 echo.
 
 if not exist "package.json" (
   echo ERROR: package.json not found. Extract the whole ZIP first.
+  pause
+  exit /b 1
+)
+if not exist ".env.production" (
+  echo ERROR: .env.production is missing.
   pause
   exit /b 1
 )

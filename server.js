@@ -1,7 +1,233 @@
+/* eslint-env node */
 import express from 'express';
 import { createServer } from 'http';
 import { Server } from 'socket.io';
 
+
+// Railway-safe 101-pool rules. These are intentionally embedded in the
+// socket server so the production backend does not depend on frontend src/
+// files being present in the Docker/GitHub build context.
+const RULE_HIGH_CARDS = new Set(['A', '10', 'J', 'Q', 'K']);
+
+function ruleIsPrintedJoker(card) {
+  return !!card && (
+    card.isJoker === true
+    || card.rank === 'JKR'
+    || card.suit === 'JOKER'
+    || card.suit === '🃏'
+  );
+}
+
+function ruleIsWildJoker(card, wildJoker = null) {
+  if (!card || ruleIsPrintedJoker(card)) return false;
+  return card.isWildJoker === true
+    || (!!wildJoker && !ruleIsPrintedJoker(wildJoker) && card.rank === wildJoker.rank);
+}
+
+function ruleIsJokerCard(card, wildJoker = null) {
+  return ruleIsPrintedJoker(card) || ruleIsWildJoker(card, wildJoker);
+}
+
+function ruleCardPoints(card, wildJoker = null) {
+  if (!card || ruleIsJokerCard(card, wildJoker)) return 0;
+  if (RULE_HIGH_CARDS.has(String(card.rank))) return 10;
+  return Math.max(0, Number(card.pts ?? card.value ?? card.rank) || 0);
+}
+
+function ruleRankNumber(rank, aceHigh = false) {
+  if (rank === 'A') return aceHigh ? 14 : 1;
+  if (rank === 'J') return 11;
+  if (rank === 'Q') return 12;
+  if (rank === 'K') return 13;
+  return Number(rank) || 0;
+}
+
+function ruleCanFormSequence(naturals, jokerCount) {
+  if (!naturals.length) return false;
+  if (new Set(naturals.map((card) => card.suit)).size !== 1) return false;
+
+  const groupSize = naturals.length + jokerCount;
+  if (groupSize < 3 || groupSize > 13) return false;
+
+  for (const aceHigh of [false, true]) {
+    const ranks = naturals
+      .map((card) => ruleRankNumber(card.rank, aceHigh))
+      .sort((a, b) => a - b);
+    if (ranks.some((rank) => rank < 1 || rank > 14)) continue;
+    if (new Set(ranks).size !== ranks.length) continue;
+
+    const minRank = ranks[0];
+    const maxRank = ranks[ranks.length - 1];
+    const earliestStart = Math.max(1, maxRank - groupSize + 1);
+    const latestStart = Math.min(minRank, 15 - groupSize);
+    if (earliestStart <= latestStart) return true;
+  }
+
+  return false;
+}
+
+function ruleEvaluateMeld(cards, wildJoker = null) {
+  const group = Array.isArray(cards) ? cards.filter(Boolean) : [];
+  if (group.length < 3) return null;
+
+  const printed = group.filter(ruleIsPrintedJoker);
+  const wild = group.filter((card) => ruleIsWildJoker(card, wildJoker));
+  const jokers = [...printed, ...wild];
+  const naturals = group.filter(
+    (card) => !ruleIsPrintedJoker(card) && !ruleIsWildJoker(card, wildJoker),
+  );
+
+  if (printed.length === 0 && ruleCanFormSequence([...naturals, ...wild], 0)) {
+    return { type: 'pure_sequence', sequence: true, pure: true };
+  }
+
+  if (naturals.length > 0 && ruleCanFormSequence(naturals, jokers.length)) {
+    return { type: 'sequence', sequence: true, pure: false };
+  }
+
+  if (group.length <= 4 && naturals.length > 0) {
+    const ranks = new Set(naturals.map((card) => card.rank));
+    const suits = new Set(naturals.map((card) => card.suit));
+    if (ranks.size === 1 && suits.size === naturals.length) {
+      return { type: 'set', sequence: false, pure: false };
+    }
+  }
+
+  return null;
+}
+
+function ruleEnumerateMelds(hand, wildJoker = null) {
+  const melds = [];
+  const limit = 1 << hand.length;
+  const points = hand.map((card) => ruleCardPoints(card, wildJoker));
+
+  for (let mask = 1; mask < limit; mask += 1) {
+    const cards = [];
+    let count = 0;
+    let coveredPoints = 0;
+    for (let index = 0; index < hand.length; index += 1) {
+      if ((mask & (1 << index)) === 0) continue;
+      count += 1;
+      cards.push(hand[index]);
+      coveredPoints += points[index];
+    }
+    if (count < 3) continue;
+    const evaluation = ruleEvaluateMeld(cards, wildJoker);
+    if (evaluation) melds.push({ mask, coveredPoints, ...evaluation });
+  }
+
+  return melds;
+}
+
+function ruleBuildMeldIndex(hand, melds) {
+  const byCard = Array.from({ length: hand.length }, () => []);
+  for (const meld of melds) {
+    for (let index = 0; index < hand.length; index += 1) {
+      if (meld.mask & (1 << index)) byCard[index].push(meld);
+    }
+  }
+  return byCard;
+}
+
+function validate101Declaration(hand, wildJoker = null) {
+  if (!Array.isArray(hand) || hand.length !== 13) {
+    return { valid: false, reason: 'A declaration must contain exactly 13 cards.' };
+  }
+
+  const melds = ruleEnumerateMelds(hand, wildJoker);
+  const byCard = ruleBuildMeldIndex(hand, melds);
+  const fullMask = (1 << hand.length) - 1;
+  const memo = new Map();
+
+  function search(remainingMask, sequenceCount, hasPureSequence) {
+    if (remainingMask === 0) return sequenceCount >= 2 && hasPureSequence;
+    const key = `${remainingMask}:${Math.min(sequenceCount, 2)}:${hasPureSequence ? 1 : 0}`;
+    if (memo.has(key)) return memo.get(key);
+
+    let first = 0;
+    while ((remainingMask & (1 << first)) === 0) first += 1;
+    for (const meld of byCard[first]) {
+      if ((meld.mask & remainingMask) !== meld.mask) continue;
+      if (search(
+        remainingMask ^ meld.mask,
+        Math.min(2, sequenceCount + (meld.sequence ? 1 : 0)),
+        hasPureSequence || meld.pure,
+      )) {
+        memo.set(key, true);
+        return true;
+      }
+    }
+
+    memo.set(key, false);
+    return false;
+  }
+
+  const valid = search(fullMask, 0, false);
+  return {
+    valid,
+    reason: valid
+      ? ''
+      : 'Need two sequences, including one pure sequence, with every card in a valid meld.',
+  };
+}
+
+function calculate101Penalty(hand, wildJoker = null) {
+  const cards = Array.isArray(hand) ? hand.filter(Boolean) : [];
+  if (!cards.length) return 0;
+
+  const points = cards.map((card) => ruleCardPoints(card, wildJoker));
+  const totalPoints = points.reduce((sum, point) => sum + point, 0);
+  const melds = ruleEnumerateMelds(cards, wildJoker);
+  const byCard = ruleBuildMeldIndex(cards, melds);
+  const fullMask = (1 << cards.length) - 1;
+
+  const pureMemo = new Map();
+  function bestPureCoverage(mask) {
+    if (mask === 0) return 0;
+    if (pureMemo.has(mask)) return pureMemo.get(mask);
+    let first = 0;
+    while ((mask & (1 << first)) === 0) first += 1;
+    let best = bestPureCoverage(mask ^ (1 << first));
+    for (const meld of byCard[first]) {
+      if (!meld.pure || (meld.mask & mask) !== meld.mask) continue;
+      best = Math.max(best, meld.coveredPoints + bestPureCoverage(mask ^ meld.mask));
+    }
+    pureMemo.set(mask, best);
+    return best;
+  }
+
+  const fullMemo = new Map();
+  function bestFullCoverage(mask, sequenceCount, hasPureSequence) {
+    if (mask === 0) {
+      return sequenceCount >= 2 && hasPureSequence ? 0 : Number.NEGATIVE_INFINITY;
+    }
+    const key = `${mask}:${Math.min(sequenceCount, 2)}:${hasPureSequence ? 1 : 0}`;
+    if (fullMemo.has(key)) return fullMemo.get(key);
+
+    let first = 0;
+    while ((mask & (1 << first)) === 0) first += 1;
+    let best = bestFullCoverage(mask ^ (1 << first), sequenceCount, hasPureSequence);
+    for (const meld of byCard[first]) {
+      if ((meld.mask & mask) !== meld.mask) continue;
+      const tail = bestFullCoverage(
+        mask ^ meld.mask,
+        Math.min(2, sequenceCount + (meld.sequence ? 1 : 0)),
+        hasPureSequence || meld.pure,
+      );
+      if (Number.isFinite(tail)) best = Math.max(best, meld.coveredPoints + tail);
+    }
+    fullMemo.set(key, best);
+    return best;
+  }
+
+  const pureCoverage = bestPureCoverage(fullMask);
+  const fullCoverage = bestFullCoverage(fullMask, 0, false);
+  const protectedPoints = Math.max(
+    pureCoverage,
+    Number.isFinite(fullCoverage) ? fullCoverage : 0,
+  );
+  return Math.min(80, Math.max(0, totalPoints - protectedPoints));
+}
 const app = express();
 const httpServer = createServer(app);
 
@@ -17,6 +243,10 @@ const io = new Server(httpServer, {
 const MAX_PLAYERS = 6;
 const RECONNECT_GRACE_MS = 45_000;
 const START_COUNTDOWN_SECONDS = 3;
+
+function normaliseTableSize(value) {
+  return Number(value) === 2 ? 2 : MAX_PLAYERS;
+}
 
 // { code: { host, hostPlayerId, players: [{ id, playerId, name, connected }] } }
 const rooms = {};
@@ -39,6 +269,12 @@ function buildDeck(offset = 0) {
       deck.push({ id: `${rank}${suit}_${id++}`, rank, suit });
     }
   }
+  deck.push({
+    id: `JKR_${offset}`,
+    rank: 'JKR',
+    suit: 'JOKER',
+    isJoker: true,
+  });
   return deck;
 }
 
@@ -55,6 +291,161 @@ function shuffle(deck) {
   return d;
 }
 
+function isWild(card, wildJoker) {
+  return !!card && !!wildJoker && card.rank === wildJoker.rank;
+}
+
+function cardPoints(card, wildJoker) {
+  if (!card || isWild(card, wildJoker)) return 0;
+  if (['A', '10', 'J', 'Q', 'K'].includes(card.rank)) return 10;
+  return Math.max(0, Number(card.rank) || 0);
+}
+
+function rankValue(rank) {
+  if (rank === 'A') return 1;
+  if (rank === 'J') return 11;
+  if (rank === 'Q') return 12;
+  if (rank === 'K') return 13;
+  return Number(rank) || 0;
+}
+
+function isSequence(cards, jokerCount) {
+  if (cards.length === 0) return false;
+  if (new Set(cards.map((card) => card.suit)).size !== 1) return false;
+
+  const ranks = cards.map((card) => rankValue(card.rank)).sort((a, b) => a - b);
+  if (ranks.some((rank) => rank < 1 || rank > 13)) return false;
+  if (new Set(ranks).size !== ranks.length) return false;
+
+  const groupSize = cards.length + jokerCount;
+  const minRank = ranks[0];
+  const maxRank = ranks[ranks.length - 1];
+  const earliestStart = Math.max(1, maxRank - groupSize + 1);
+  const latestStart = Math.min(minRank, 14 - groupSize);
+  return earliestStart <= latestStart;
+}
+
+function evaluateMeld(cards, wildJoker) {
+  if (!Array.isArray(cards) || cards.length < 3) return null;
+  const jokers = cards.filter((card) => isWild(card, wildJoker));
+  const naturals = cards.filter((card) => !isWild(card, wildJoker));
+
+  if (jokers.length === 0 && isSequence(naturals, 0)) {
+    return { type: 'pure_sequence', sequence: true, pure: true };
+  }
+
+  if (naturals.length > 0 && isSequence(naturals, jokers.length)) {
+    return { type: 'sequence', sequence: true, pure: false };
+  }
+
+  if (cards.length <= 4 && naturals.length > 0) {
+    const ranks = new Set(naturals.map((card) => card.rank));
+    const suits = new Set(naturals.map((card) => card.suit));
+    if (ranks.size === 1 && suits.size === naturals.length) {
+      return { type: 'set', sequence: false, pure: false };
+    }
+  }
+
+  return null;
+}
+
+function enumerateMelds(hand, wildJoker) {
+  const melds = [];
+  const limit = 1 << hand.length;
+  for (let mask = 1; mask < limit; mask += 1) {
+    let count = 0;
+    const cards = [];
+    for (let index = 0; index < hand.length; index += 1) {
+      if ((mask & (1 << index)) === 0) continue;
+      count += 1;
+      cards.push(hand[index]);
+    }
+    if (count < 3) continue;
+    const evaluation = evaluateMeld(cards, wildJoker);
+    if (evaluation) melds.push({ mask, cards, ...evaluation });
+  }
+  return melds;
+}
+
+function validateDeclaration(hand, wildJoker) {
+  return validate101Declaration(hand, wildJoker);
+}
+
+function calculateDeadwood(hand, wildJoker) {
+  return calculate101Penalty(hand, wildJoker);
+}
+
+function isEliminated(game, playerId) {
+  return (game.scoresByPlayerId[playerId] || 0) >= 101;
+}
+
+function isRoundActive(game, player) {
+  return !!player
+    && !isEliminated(game, player.playerId)
+    && !game.droppedPlayerIds.has(player.playerId);
+}
+
+function nextPlayableIndex(game, fromIndex) {
+  if (!game.players.length) return -1;
+  for (let offset = 1; offset <= game.players.length; offset += 1) {
+    const index = (fromIndex + offset + game.players.length) % game.players.length;
+    const player = game.players[index];
+    if (isRoundActive(game, player) && player.connected !== false) return index;
+  }
+  return -1;
+}
+
+function activeRoundPlayers(game) {
+  return game.players.filter((player) => isRoundActive(game, player));
+}
+
+function addPoints(game, playerId, points) {
+  const safePoints = Math.max(0, Math.min(80, Number(points) || 0));
+  game.scoresByPlayerId[playerId] = (game.scoresByPlayerId[playerId] || 0) + safePoints;
+  game.roundPointsByPlayerId[playerId] = (game.roundPointsByPlayerId[playerId] || 0) + safePoints;
+}
+
+function dealRound(game, incrementRound = true) {
+  if (game.nextRoundTimer) {
+    clearTimeout(game.nextRoundTimer);
+    game.nextRoundTimer = null;
+  }
+  const deck = shuffle(buildTwoDecks());
+  const handsByPlayerId = {};
+  let cursor = 0;
+
+  for (const player of game.players) {
+    if (isEliminated(game, player.playerId)) {
+      handsByPlayerId[player.playerId] = [];
+      continue;
+    }
+    handsByPlayerId[player.playerId] = deck.slice(cursor, cursor + 13);
+    cursor += 13;
+  }
+
+  const remaining = deck.slice(cursor);
+  const wildIndex = remaining.findIndex((card) => !card.isJoker);
+  const [wildJoker = null] = wildIndex >= 0 ? remaining.splice(wildIndex, 1) : [];
+  const firstDiscard = remaining.shift() || null;
+
+  game.deck = remaining;
+  game.handsByPlayerId = handsByPlayerId;
+  game.discardPile = firstDiscard ? [firstDiscard] : [];
+  game.lastDiscardByPlayerId = {};
+  game.wildJoker = wildJoker;
+  game.droppedPlayerIds = new Set();
+  game.drawnPlayerIds = new Set();
+  game.roundPointsByPlayerId = Object.fromEntries(game.players.map((player) => [player.playerId, 0]));
+  game.roundNumber = incrementRound ? (game.roundNumber || 0) + 1 : (game.roundNumber || 1);
+  game.state = 'playing';
+  game.winnerPlayerId = null;
+  game.lastRoundDetails = null;
+
+  const startingFrom = Number.isInteger(game.dealerIndex) ? game.dealerIndex : -1;
+  game.dealerIndex = nextPlayableIndex(game, startingFrom);
+  game.turnIndex = game.dealerIndex >= 0 ? game.dealerIndex : 0;
+}
+
 function publicPlayers(players) {
   return players.map((p) => ({
     id: p.id,
@@ -64,10 +455,23 @@ function publicPlayers(players) {
   }));
 }
 
+function recordGameAction(game, action) {
+  game.actionSequence = (game.actionSequence || 0) + 1;
+  game.lastAction = {
+    id: `${game.roundNumber || 1}-${game.actionSequence}`,
+    ...action,
+  };
+}
+
 function emitRoomUpdate(code) {
   const room = rooms[code];
   if (!room) return;
-  io.to(code).emit('room_update', { code, players: publicPlayers(room.players) });
+  io.to(code).emit('room_update', {
+    code,
+    hostPlayerId: room.hostPlayerId || null,
+    tableSize: normaliseTableSize(room.tableSize),
+    players: publicPlayers(room.players),
+  });
 }
 
 function timerKey(code, playerId) {
@@ -111,9 +515,14 @@ function buildSnapshot(game, forPlayerId) {
     name: p.name,
     connected: p.connected !== false,
     handSize: (game.handsByPlayerId[p.playerId] || []).length,
+    score: game.scoresByPlayerId[p.playerId] || 0,
+    roundPoints: game.roundPointsByPlayerId[p.playerId] || 0,
+    lastDiscard: game.lastDiscardByPlayerId?.[p.playerId] || null,
+    dropped: game.droppedPlayerIds.has(p.playerId),
+    isEliminated: isEliminated(game, p.playerId),
   }));
 
-  const current = game.players[game.turnIndex] || null;
+  const current = game.state === 'playing' ? (game.players[game.turnIndex] || null) : null;
 
   return {
     players: playerMeta,
@@ -125,6 +534,10 @@ function buildSnapshot(game, forPlayerId) {
     currentTurn: current?.id ?? null,
     currentTurnPlayerId: current?.playerId ?? null,
     state: game.state,
+    roundNumber: game.roundNumber || 1,
+    dealerIndex: game.dealerIndex ?? 0,
+    winnerPlayerId: game.winnerPlayerId || null,
+    lastAction: game.lastAction || null,
   };
 }
 
@@ -134,10 +547,80 @@ function sendGameStateToPlayer(code, player) {
   io.to(player.id).emit('game_state', { code, ...buildSnapshot(game, player.playerId) });
 }
 
+function sendLatestRoundResult(code, player) {
+  const game = games[code];
+  if (!game?.lastRoundDetails || !player?.connected || !player.id) return;
+  io.to(player.id).emit(
+    'round_result',
+    buildRoundResult(code, game, player.playerId, game.lastRoundDetails),
+  );
+}
+
 function broadcastGameState(code) {
   const game = games[code];
   if (!game) return;
   for (const player of game.players) sendGameStateToPlayer(code, player);
+}
+
+function buildRoundResult(code, game, forPlayerId, details = {}) {
+  return {
+    code,
+    roundNumber: game.roundNumber || 1,
+    state: game.state,
+    reason: details.reason || 'round_over',
+    message: details.message || 'Round over.',
+    declarerPlayerId: details.declarerPlayerId || null,
+    validDeclaration: details.validDeclaration ?? null,
+    roundWinnerPlayerId: details.roundWinnerPlayerId || null,
+    winnerPlayerId: game.winnerPlayerId || null,
+    nextRoundInSeconds: game.state === 'round_over' ? 5 : null,
+    scoresByPlayerId: { ...game.scoresByPlayerId },
+    roundPointsByPlayerId: { ...game.roundPointsByPlayerId },
+    hand: [...(game.handsByPlayerId[forPlayerId] || [])],
+    wildJoker: game.wildJoker || null,
+    players: game.players.map((player) => ({
+      id: player.id,
+      playerId: player.playerId,
+      name: player.name,
+      connected: player.connected !== false,
+      score: game.scoresByPlayerId[player.playerId] || 0,
+      roundPoints: game.roundPointsByPlayerId[player.playerId] || 0,
+      dropped: game.droppedPlayerIds.has(player.playerId),
+      isEliminated: isEliminated(game, player.playerId),
+      handSize: (game.handsByPlayerId[player.playerId] || []).length,
+    })),
+  };
+}
+
+function finishRound(code, details = {}) {
+  const game = games[code];
+  if (!game) return;
+
+  const remaining = game.players.filter((player) => !isEliminated(game, player.playerId));
+  if (remaining.length === 1) {
+    game.state = 'finished';
+    game.winnerPlayerId = remaining[0].playerId;
+  } else {
+    game.state = 'round_over';
+    game.winnerPlayerId = null;
+  }
+
+  game.lastRoundDetails = { ...details };
+  for (const player of game.players) {
+    if (!player.connected || !player.id) continue;
+    io.to(player.id).emit('round_result', buildRoundResult(code, game, player.playerId, details));
+  }
+  broadcastGameState(code);
+
+  if (game.state === 'round_over') {
+    game.nextRoundTimer = setTimeout(() => {
+      const current = games[code];
+      if (!current || current.state !== 'round_over') return;
+      dealRound(current);
+      io.to(code).emit('round_started', { code, roundNumber: current.roundNumber });
+      broadcastGameState(code);
+    }, 5_000);
+  }
 }
 
 function removePlayerAfterGrace(code, playerId) {
@@ -152,17 +635,36 @@ function removePlayerAfterGrace(code, playerId) {
 
   const game = games[code];
   if (game) {
+    const previousTurnPlayerId = game.players[game.turnIndex]?.playerId || null;
     const removedGameIndex = game.players.findIndex((p) => p.playerId === playerId);
     if (removedGameIndex >= 0) {
       game.players.splice(removedGameIndex, 1);
       delete game.handsByPlayerId[playerId];
+      delete game.scoresByPlayerId[playerId];
+      delete game.roundPointsByPlayerId[playerId];
+      game.droppedPlayerIds.delete(playerId);
 
       if (game.players.length === 0) {
         delete games[code];
       } else {
         if (removedGameIndex < game.turnIndex) game.turnIndex -= 1;
         if (game.turnIndex >= game.players.length) game.turnIndex = 0;
-        broadcastGameState(code);
+        if (game.dealerIndex >= game.players.length) game.dealerIndex = 0;
+
+        if (game.state === 'playing' && game.players.length === 1) {
+          finishRound(code, {
+            reason: 'opponents_left',
+            message: `${game.players[0].name} wins because all opponents left the room.`,
+          });
+        } else {
+          const currentStillValid = game.players[game.turnIndex]?.playerId === previousTurnPlayerId
+            && isRoundActive(game, game.players[game.turnIndex]);
+          if (game.state === 'playing' && !currentStillValid) {
+            const nextIndex = nextPlayableIndex(game, game.turnIndex - 1);
+            if (nextIndex >= 0) game.turnIndex = nextIndex;
+          }
+          broadcastGameState(code);
+        }
       }
     }
   }
@@ -199,6 +701,7 @@ io.on('connection', (socket) => {
     const playerId = String(payload.playerId || '').trim();
     const playerName = String(payload.playerName || 'Host').trim().slice(0, 40) || 'Host';
     const entryFee = Math.max(0, Number(payload.entryFee) || 0);
+    const tableSize = normaliseTableSize(payload.tableSize);
 
     if (!code || !playerId) {
       const response = { ok: false, message: 'Room code and player identity are required.' };
@@ -225,9 +728,10 @@ io.on('connection', (socket) => {
       bindPlayerSocket(code, hostPlayer, socket);
       existing.host = socket.id;
       if (entryFee > 0) existing.entryFee = entryFee;
+      if (!games[code]) existing.tableSize = tableSize;
       socket.emit('room_registered', { code, resumed: true });
       emitRoomUpdate(code);
-      const response = { ok: true, code, resumed: true, entryFee: existing.entryFee || 0, players: publicPlayers(existing.players) };
+      const response = { ok: true, code, resumed: true, hostPlayerId: existing.hostPlayerId || null, entryFee: existing.entryFee || 0, tableSize: existing.tableSize, players: publicPlayers(existing.players) };
       ack?.(response);
       return;
     }
@@ -236,19 +740,21 @@ io.on('connection', (socket) => {
       host: socket.id,
       hostPlayerId: playerId,
       entryFee,
+      tableSize,
       players: [{ id: socket.id, playerId, name: playerName, connected: true }],
     };
     socket.join(code);
     socket.emit('room_registered', { code, resumed: false });
     emitRoomUpdate(code);
-    ack?.({ ok: true, code, resumed: false, entryFee: rooms[code].entryFee || 0, players: publicPlayers(rooms[code].players) });
+    ack?.({ ok: true, code, resumed: false, hostPlayerId: rooms[code].hostPlayerId || null, entryFee: rooms[code].entryFee || 0, tableSize, players: publicPlayers(rooms[code].players) });
   });
 
   socket.on('validate_room', (payload = {}, ack) => {
     const code = normaliseCode(payload.code);
     const room = rooms[code];
-    const valid = !!room && !games[code] && room.players.length < MAX_PLAYERS;
-    const response = { code, valid, entryFee: room?.entryFee || 0, playerCount: room?.players?.length || 0 };
+    const roomTableSize = normaliseTableSize(room?.tableSize);
+    const valid = !!room && !games[code] && room.players.length < roomTableSize;
+    const response = { code, valid, entryFee: room?.entryFee || 0, tableSize: roomTableSize, playerCount: room?.players?.length || 0 };
     socket.emit('room_validated', response);
     ack?.({ ok: true, ...response });
   });
@@ -279,7 +785,7 @@ io.on('connection', (socket) => {
       ack?.(response);
       return;
     }
-    if (!player && room.players.length >= MAX_PLAYERS) {
+    if (!player && room.players.length >= normaliseTableSize(room.tableSize)) {
       const response = { ok: false, message: 'Room is full.' };
       socket.emit('room_error', response);
       ack?.(response);
@@ -297,9 +803,34 @@ io.on('connection', (socket) => {
     emitRoomUpdate(code);
     socket.emit('room_joined', { code });
 
-    if (games[code]) sendGameStateToPlayer(code, findGamePlayer(games[code], playerId, socket.id));
+    if (games[code]) {
+      const gamePlayer = findGamePlayer(games[code], playerId, socket.id);
+      sendGameStateToPlayer(code, gamePlayer);
+      sendLatestRoundResult(code, gamePlayer);
+    }
 
-    ack?.({ ok: true, code, entryFee: room.entryFee || 0, players: publicPlayers(room.players), resumed: !!games[code] });
+    ack?.({ ok: true, code, hostPlayerId: room.hostPlayerId || null, entryFee: room.entryFee || 0, tableSize: normaliseTableSize(room.tableSize), players: publicPlayers(room.players), resumed: !!games[code] });
+  });
+
+  socket.on('leave_room', (payload = {}, ack) => {
+    const code = normaliseCode(payload.code);
+    const playerId = String(payload.playerId || '').trim();
+    const room = rooms[code];
+    const player = room?.players.find((p) => p.playerId === playerId);
+
+    if (!room || !player) {
+      ack?.({ ok: true, code, alreadyLeft: true });
+      return;
+    }
+
+    clearDisconnectTimer(code, playerId);
+    player.connected = false;
+    const gamePlayer = games[code]?.players.find((p) => p.playerId === playerId);
+    if (gamePlayer) gamePlayer.connected = false;
+    socket.leave(code);
+    io.to(code).emit('player_left', { code, playerId, name: player.name });
+    removePlayerAfterGrace(code, playerId);
+    ack?.({ ok: true, code });
   });
 
   socket.on('rejoin_room', (payload = {}, ack) => {
@@ -318,7 +849,10 @@ io.on('connection', (socket) => {
     emitRoomUpdate(code);
 
     const gamePlayer = findGamePlayer(games[code], playerId, socket.id);
-    if (gamePlayer) sendGameStateToPlayer(code, gamePlayer);
+    if (gamePlayer) {
+      sendGameStateToPlayer(code, gamePlayer);
+      sendLatestRoundResult(code, gamePlayer);
+    }
 
     socket.emit('room_rejoined', { code });
     ack?.({ ok: true, code, inGame: !!games[code] });
@@ -347,6 +881,7 @@ io.on('connection', (socket) => {
     if (roomPlayer) bindPlayerSocket(code, roomPlayer, socket);
 
     sendGameStateToPlayer(code, player);
+    sendLatestRoundResult(code, player);
     ack?.({ ok: true });
   });
 
@@ -400,27 +935,20 @@ io.on('connection', (socket) => {
         return;
       }
 
-      const deck = shuffle(buildTwoDecks());
-      const handsByPlayerId = {};
-      let cursor = 0;
-      for (const player of players) {
-        handsByPlayerId[player.playerId] = deck.slice(cursor, cursor + 13);
-        cursor += 13;
-      }
-
-      const remaining = deck.slice(cursor);
-      const firstDiscard = remaining.shift();
-      const wildJoker = remaining.shift() || firstDiscard || null;
-
-      games[code] = {
+      const game = {
         players,
-        deck: remaining,
-        handsByPlayerId,
-        discardPile: firstDiscard ? [firstDiscard] : [],
-        wildJoker,
-        turnIndex: 0,
-        state: 'playing',
+        scoresByPlayerId: Object.fromEntries(players.map((player) => [player.playerId, 0])),
+        roundPointsByPlayerId: {},
+        droppedPlayerIds: new Set(),
+        lastDiscardByPlayerId: {},
+        roundNumber: 0,
+        dealerIndex: -1,
+        winnerPlayerId: null,
+        actionSequence: 0,
+        lastAction: null,
       };
+      games[code] = game;
+      dealRound(game);
 
       broadcastGameState(code);
     }, START_COUNTDOWN_SECONDS * 1000);
@@ -438,10 +966,16 @@ io.on('connection', (socket) => {
       ack?.(response);
       return;
     }
+    if (game.state !== 'playing') {
+      const response = { ok: false, message: 'This round is not accepting moves.' };
+      socket.emit('game_error', response);
+      ack?.(response);
+      return;
+    }
 
     const actor = findGamePlayer(game, playerId, socket.id);
     const currentPlayer = game.players[game.turnIndex];
-    if (!actor || !currentPlayer || actor.playerId !== currentPlayer.playerId) {
+    if (!actor || !currentPlayer || actor.playerId !== currentPlayer.playerId || !isRoundActive(game, actor)) {
       const response = { ok: false, message: 'Not your turn.' };
       socket.emit('game_error', response);
       ack?.(response);
@@ -490,7 +1024,13 @@ io.on('connection', (socket) => {
     }
 
     hand.push(card);
+    game.drawnPlayerIds.add(actor.playerId);
     game.handsByPlayerId[actor.playerId] = hand;
+    recordGameAction(game, {
+      type: 'draw',
+      playerId: actor.playerId,
+      source: fromDiscard ? 'discard' : 'closed',
+    });
     broadcastGameState(code);
     ack?.({ ok: true, cardId: card.id });
   });
@@ -507,10 +1047,16 @@ io.on('connection', (socket) => {
       ack?.(response);
       return;
     }
+    if (game.state !== 'playing') {
+      const response = { ok: false, message: 'This round is not accepting moves.' };
+      socket.emit('game_error', response);
+      ack?.(response);
+      return;
+    }
 
     const actor = findGamePlayer(game, playerId, socket.id);
     const currentPlayer = game.players[game.turnIndex];
-    if (!actor || !currentPlayer || actor.playerId !== currentPlayer.playerId) {
+    if (!actor || !currentPlayer || actor.playerId !== currentPlayer.playerId || !isRoundActive(game, actor)) {
       const response = { ok: false, message: 'Not your turn.' };
       socket.emit('game_error', response);
       ack?.(response);
@@ -537,9 +1083,205 @@ io.on('connection', (socket) => {
 
     const [card] = hand.splice(cardIndex, 1);
     game.discardPile.push(card);
-    game.turnIndex = (game.turnIndex + 1) % game.players.length;
+    game.lastDiscardByPlayerId[actor.playerId] = card;
+    recordGameAction(game, {
+      type: 'discard',
+      playerId: actor.playerId,
+      card,
+    });
+    const nextTurnIndex = nextPlayableIndex(game, game.turnIndex);
+    if (nextTurnIndex < 0) {
+      const response = { ok: false, message: 'No active player is available for the next turn.' };
+      socket.emit('game_error', response);
+      ack?.(response);
+      return;
+    }
+    game.turnIndex = nextTurnIndex;
     broadcastGameState(code);
     ack?.({ ok: true, nextTurnPlayerId: game.players[game.turnIndex]?.playerId || null });
+  });
+
+  socket.on('drop_game', (payload = {}, ack) => {
+    const code = normaliseCode(payload.code);
+    const playerId = String(payload.playerId || '').trim();
+    const game = games[code];
+
+    if (!game || game.state !== 'playing') {
+      const response = { ok: false, message: 'No active round was found.' };
+      socket.emit('game_error', response);
+      ack?.(response);
+      return;
+    }
+
+    const actor = findGamePlayer(game, playerId, socket.id);
+    const currentPlayer = game.players[game.turnIndex];
+    if (!actor || !currentPlayer || actor.playerId !== currentPlayer.playerId || !isRoundActive(game, actor)) {
+      const response = { ok: false, message: 'You can only drop on your turn.' };
+      socket.emit('game_error', response);
+      ack?.(response);
+      return;
+    }
+
+    const hand = game.handsByPlayerId[actor.playerId] || [];
+    if (hand.length !== 13 && hand.length !== 14) {
+      const response = { ok: false, message: 'Your hand is not in a droppable state.' };
+      socket.emit('game_error', response);
+      ack?.(response);
+      return;
+    }
+
+    const penalty = game.drawnPlayerIds.has(actor.playerId) ? 40 : 20;
+    addPoints(game, actor.playerId, penalty);
+    game.droppedPlayerIds.add(actor.playerId);
+    io.to(code).emit('player_dropped', { code, playerId: actor.playerId, penalty });
+
+    const stillPlaying = activeRoundPlayers(game);
+    if (stillPlaying.length <= 1) {
+      finishRound(code, {
+        reason: 'last_player_after_drop',
+        roundWinnerPlayerId: stillPlaying[0]?.playerId || null,
+        message: stillPlaying.length === 1
+          ? `${stillPlaying[0].name} wins the round after the other players dropped.`
+          : 'Round ended because no active players remain.',
+      });
+      ack?.({ ok: true, penalty, roundOver: true });
+      return;
+    }
+
+    const nextTurnIndex = nextPlayableIndex(game, game.turnIndex);
+    if (nextTurnIndex < 0) {
+      finishRound(code, { reason: 'no_connected_players', message: 'Round paused because no active player is connected.' });
+      ack?.({ ok: true, penalty, roundOver: true });
+      return;
+    }
+
+    game.turnIndex = nextTurnIndex;
+    broadcastGameState(code);
+    ack?.({ ok: true, penalty, roundOver: false, nextTurnPlayerId: game.players[game.turnIndex]?.playerId || null });
+  });
+
+  socket.on('declare', (payload = {}, ack) => {
+    const code = normaliseCode(payload.code);
+    const playerId = String(payload.playerId || '').trim();
+    const cardId = String(payload.cardId || '').trim();
+    const game = games[code];
+
+    if (!game || game.state !== 'playing') {
+      const response = { ok: false, message: 'No active round was found.' };
+      socket.emit('game_error', response);
+      ack?.(response);
+      return;
+    }
+
+    const actor = findGamePlayer(game, playerId, socket.id);
+    const currentPlayer = game.players[game.turnIndex];
+    if (!actor || !currentPlayer || actor.playerId !== currentPlayer.playerId || !isRoundActive(game, actor)) {
+      const response = { ok: false, message: 'You can only declare on your turn.' };
+      socket.emit('game_error', response);
+      ack?.(response);
+      return;
+    }
+
+    const hand = game.handsByPlayerId[actor.playerId] || [];
+    if (hand.length !== 14) {
+      const response = { ok: false, message: 'Draw a card before declaring.' };
+      socket.emit('game_error', response);
+      ack?.(response);
+      return;
+    }
+
+    const discardIndex = hand.findIndex((card) => card.id === cardId);
+    if (discardIndex < 0) {
+      const response = { ok: false, message: 'Select a card from your hand for the finish slot.' };
+      socket.emit('game_error', response);
+      ack?.(response);
+      return;
+    }
+
+    const [discardedCard] = hand.splice(discardIndex, 1);
+    game.discardPile.push(discardedCard);
+    game.lastDiscardByPlayerId[actor.playerId] = discardedCard;
+    game.handsByPlayerId[actor.playerId] = hand;
+
+    const verdict = validateDeclaration(hand, game.wildJoker);
+
+    io.to(code).emit('player_declared', {
+      code,
+      playerId: actor.playerId,
+      valid: verdict.valid,
+      reason: verdict.reason,
+    });
+
+    if (!verdict.valid) {
+      addPoints(game, actor.playerId, 80);
+      game.droppedPlayerIds.add(actor.playerId);
+      io.to(code).emit('player_dropped', { code, playerId: actor.playerId, penalty: 80, reason: 'wrong_declaration' });
+
+      const stillPlaying = activeRoundPlayers(game);
+      if (stillPlaying.length <= 1) {
+        finishRound(code, {
+          reason: 'wrong_declaration',
+          message: `${actor.name} made a wrong declaration and received 80 points.`,
+          declarerPlayerId: actor.playerId,
+          validDeclaration: false,
+          roundWinnerPlayerId: stillPlaying[0]?.playerId || null,
+        });
+        ack?.({ ok: true, valid: false, roundOver: true, reason: verdict.reason });
+        return;
+      }
+
+      const nextTurnIndex = nextPlayableIndex(game, game.turnIndex);
+      if (nextTurnIndex >= 0) game.turnIndex = nextTurnIndex;
+      broadcastGameState(code);
+      ack?.({ ok: true, valid: false, roundOver: false, reason: verdict.reason });
+      return;
+    }
+
+    for (const player of game.players) {
+      if (game.droppedPlayerIds.has(player.playerId) || player.playerId === actor.playerId) continue;
+      addPoints(game, player.playerId, calculateDeadwood(game.handsByPlayerId[player.playerId] || [], game.wildJoker));
+    }
+
+    finishRound(code, {
+      reason: 'valid_declaration',
+      message: `${actor.name} made a valid declaration.`,
+      declarerPlayerId: actor.playerId,
+      validDeclaration: true,
+      roundWinnerPlayerId: actor.playerId,
+    });
+    ack?.({ ok: true, valid: true, roundOver: true, reason: verdict.reason });
+  });
+
+  socket.on('start_next_round', (payload = {}, ack) => {
+    const code = normaliseCode(payload.code);
+    const playerId = String(payload.playerId || '').trim();
+    const game = games[code];
+
+    if (!game) {
+      ack?.({ ok: false, message: 'Game not found.' });
+      return;
+    }
+    if (!findGamePlayer(game, playerId, socket.id)) {
+      ack?.({ ok: false, message: 'Player is not part of this game.' });
+      return;
+    }
+    if (game.state === 'finished') {
+      ack?.({ ok: false, message: 'The game is already finished.', winnerPlayerId: game.winnerPlayerId });
+      return;
+    }
+    if (game.state !== 'round_over') {
+      ack?.({ ok: false, message: 'The next round is not ready yet.' });
+      return;
+    }
+
+    if (game.nextRoundTimer) {
+      clearTimeout(game.nextRoundTimer);
+      game.nextRoundTimer = null;
+    }
+    dealRound(game);
+    io.to(code).emit('round_started', { code, roundNumber: game.roundNumber });
+    broadcastGameState(code);
+    ack?.({ ok: true, code, roundNumber: game.roundNumber });
   });
 
   socket.on('disconnect', () => {

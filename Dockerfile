@@ -3,7 +3,8 @@ FROM node:22-alpine
 WORKDIR /app
 ENV NODE_ENV=production
 
-# Railway only needs the real-time backend. Do not build the Vite/Android frontend here.
+# Railway socket backend only. server.js is self-contained; no frontend src/
+# files are required in the Docker build context.
 COPY railway-package.json ./package.json
 RUN npm install --omit=dev --no-audit --no-fund
 
