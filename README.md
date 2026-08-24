@@ -1,7 +1,18 @@
-# Star Rummy 101 — Railway Final Backend
+# Star Rummy 101 - Railway Backend (Scoreboard + Joker Final)
 
-Matching backend snapshot for the final Finish Confirmation build.
+This backend matches `Star_Rummy_101_FINAL_SCOREBOARD_JOKER_101_FIXED`.
 
-Railway deploy files: `Dockerfile`, `server.js`, `railway-package.json`, `railway.json`, `.dockerignore`.
+## Included backend fixes
+- 101 Pool wild-joker indicator supports A, 2-10, J, Q, K and printed Joker.
+- Numeric wild Jokers from the closed deck are preserved as Jokers.
+- Current-round Joker indicator is authoritative, preventing stale wild flags from older rounds.
+- Printed Joker indicator makes Aces wild for the round.
+- Room snapshots preserve and send `lastRoundPoints` so the previous completed round remains visible on the in-table scoreboard during the next deal.
+- Round results expose the same score data to every connected player.
+- Existing room stop/disconnect and finish/declaration flows are retained.
 
-The new Finish YES/NO popup is client-side and emits the existing `declare` action only after YES, so no new Socket.IO event is required. This server still contains the latest room lifecycle, Joker/101 rules, disconnect/game-stop handling, and self-contained Docker deployment fixes.
+## Railway deployment
+Replace the backend files in the Railway-connected repository with the files in this folder and redeploy.
+The Docker backend is self-contained and does not import frontend `src/` files.
+
+After deployment, test Create Room -> Join Room -> multiple rounds and confirm the scoreboard carries the previous deal's points into the next deal.

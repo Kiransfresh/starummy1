@@ -26,7 +26,10 @@ function ruleWildJokerRank(wildJoker = null) {
 function ruleIsWildJoker(card, wildJoker = null) {
   if (!card || ruleIsPrintedJoker(card)) return false;
   const wildRank = ruleWildJokerRank(wildJoker);
-  return card.isWildJoker === true || (!!wildRank && card.rank === wildRank);
+  // The current round indicator is authoritative. Never let an old display
+  // flag make the wrong rank a joker after a new 101 Pool deal starts.
+  if (wildRank) return String(card.rank) === String(wildRank);
+  return card.isWildJoker === true;
 }
 
 function ruleIsJokerCard(card, wildJoker = null) {
@@ -296,6 +299,19 @@ function shuffle(deck) {
   return d;
 }
 
+function selectWildJokerIndex(cards = [], random = Math.random) {
+  if (!Array.isArray(cards) || cards.length === 0) return -1;
+  const eligible = [];
+  for (let index = 0; index < cards.length; index += 1) {
+    const card = cards[index];
+    if (ruleIsPrintedJoker(card) || RANKS.includes(String(card?.rank))) eligible.push(index);
+  }
+  if (eligible.length === 0) return -1;
+  const roll = Number(random?.());
+  const safeRoll = Number.isFinite(roll) ? Math.min(.999999999, Math.max(0, roll)) : 0;
+  return eligible[Math.floor(safeRoll * eligible.length)];
+}
+
 function isWild(card, wildJoker) {
   if (!card || ruleIsPrintedJoker(card)) return false;
   const wildRank = ruleWildJokerRank(wildJoker);
@@ -431,7 +447,9 @@ function dealRound(game, incrementRound = true) {
   }
 
   const remaining = deck.slice(cursor);
-  const wildIndex = remaining.length > 0 ? Math.floor(Math.random() * remaining.length) : -1;
+  // 101 Pool joker indicator can be any natural rank (including 2-10) or
+  // the printed joker. This uses the same selection practice as the client.
+  const wildIndex = selectWildJokerIndex(remaining);
   const [wildJoker = null] = wildIndex >= 0 ? remaining.splice(wildIndex, 1) : [];
   const firstDiscard = remaining.shift() || null;
 
@@ -442,6 +460,9 @@ function dealRound(game, incrementRound = true) {
   game.wildJoker = wildJoker;
   game.droppedPlayerIds = new Set();
   game.drawnPlayerIds = new Set();
+  if (!game.lastRoundPointsByPlayerId) {
+    game.lastRoundPointsByPlayerId = Object.fromEntries(game.players.map((player) => [player.playerId, 0]));
+  }
   game.roundPointsByPlayerId = Object.fromEntries(game.players.map((player) => [player.playerId, 0]));
   game.roundNumber = incrementRound ? (game.roundNumber || 0) + 1 : (game.roundNumber || 1);
   game.state = 'playing';
@@ -524,6 +545,7 @@ function buildSnapshot(game, forPlayerId) {
     handSize: (game.handsByPlayerId[p.playerId] || []).length,
     score: game.scoresByPlayerId[p.playerId] || 0,
     roundPoints: game.roundPointsByPlayerId[p.playerId] || 0,
+    lastRoundPoints: game.lastRoundPointsByPlayerId?.[p.playerId] || 0,
     lastDiscard: game.lastDiscardByPlayerId?.[p.playerId] || null,
     dropped: game.droppedPlayerIds.has(p.playerId),
     isEliminated: isEliminated(game, p.playerId),
@@ -583,6 +605,7 @@ function buildRoundResult(code, game, forPlayerId, details = {}) {
     nextRoundInSeconds: game.state === 'round_over' ? 5 : null,
     scoresByPlayerId: { ...game.scoresByPlayerId },
     roundPointsByPlayerId: { ...game.roundPointsByPlayerId },
+    lastRoundPointsByPlayerId: { ...(game.lastRoundPointsByPlayerId || game.roundPointsByPlayerId) },
     hand: [...(game.handsByPlayerId[forPlayerId] || [])],
     wildJoker: game.wildJoker || null,
     players: game.players.map((player) => ({
@@ -592,6 +615,7 @@ function buildRoundResult(code, game, forPlayerId, details = {}) {
       connected: player.connected !== false,
       score: game.scoresByPlayerId[player.playerId] || 0,
       roundPoints: game.roundPointsByPlayerId[player.playerId] || 0,
+      lastRoundPoints: game.roundPointsByPlayerId[player.playerId] || 0,
       dropped: game.droppedPlayerIds.has(player.playerId),
       isEliminated: isEliminated(game, player.playerId),
       handSize: (game.handsByPlayerId[player.playerId] || []).length,
@@ -602,6 +626,10 @@ function buildRoundResult(code, game, forPlayerId, details = {}) {
 function finishRound(code, details = {}) {
   const game = games[code];
   if (!game) return;
+
+  // Preserve the completed deal on the table scoreboard while the next deal
+  // is playing. This is sent to every client and survives reconnects.
+  game.lastRoundPointsByPlayerId = { ...game.roundPointsByPlayerId };
 
   const remaining = game.players.filter((player) => !isEliminated(game, player.playerId));
   if (remaining.length === 1) {
@@ -675,6 +703,7 @@ function removePlayerAfterGrace(code, playerId) {
       delete game.handsByPlayerId[playerId];
       delete game.scoresByPlayerId[playerId];
       delete game.roundPointsByPlayerId[playerId];
+      if (game.lastRoundPointsByPlayerId) delete game.lastRoundPointsByPlayerId[playerId];
       game.droppedPlayerIds.delete(playerId);
 
       if (game.players.length === 0) {
@@ -973,6 +1002,7 @@ io.on('connection', (socket) => {
         players,
         scoresByPlayerId: Object.fromEntries(players.map((player) => [player.playerId, 0])),
         roundPointsByPlayerId: {},
+        lastRoundPointsByPlayerId: Object.fromEntries(players.map((player) => [player.playerId, 0])),
         droppedPlayerIds: new Set(),
         lastDiscardByPlayerId: {},
         roundNumber: 0,
