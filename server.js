@@ -18,10 +18,15 @@ function ruleIsPrintedJoker(card) {
   );
 }
 
+function ruleWildJokerRank(wildJoker = null) {
+  if (!wildJoker) return null;
+  return ruleIsPrintedJoker(wildJoker) ? 'A' : wildJoker.rank;
+}
+
 function ruleIsWildJoker(card, wildJoker = null) {
   if (!card || ruleIsPrintedJoker(card)) return false;
-  return card.isWildJoker === true
-    || (!!wildJoker && !ruleIsPrintedJoker(wildJoker) && card.rank === wildJoker.rank);
+  const wildRank = ruleWildJokerRank(wildJoker);
+  return card.isWildJoker === true || (!!wildRank && card.rank === wildRank);
 }
 
 function ruleIsJokerCard(card, wildJoker = null) {
@@ -292,7 +297,9 @@ function shuffle(deck) {
 }
 
 function isWild(card, wildJoker) {
-  return !!card && !!wildJoker && card.rank === wildJoker.rank;
+  if (!card || ruleIsPrintedJoker(card)) return false;
+  const wildRank = ruleWildJokerRank(wildJoker);
+  return !!wildRank && card.rank === wildRank;
 }
 
 function cardPoints(card, wildJoker) {
@@ -424,7 +431,7 @@ function dealRound(game, incrementRound = true) {
   }
 
   const remaining = deck.slice(cursor);
-  const wildIndex = remaining.findIndex((card) => !card.isJoker);
+  const wildIndex = remaining.length > 0 ? Math.floor(Math.random() * remaining.length) : -1;
   const [wildJoker = null] = wildIndex >= 0 ? remaining.splice(wildIndex, 1) : [];
   const firstDiscard = remaining.shift() || null;
 
@@ -621,6 +628,32 @@ function finishRound(code, details = {}) {
       broadcastGameState(code);
     }, 5_000);
   }
+}
+
+function stopActiveGameForExit(code, playerId, playerName, reason = 'left') {
+  const game = games[code];
+  if (!game || game.state !== 'playing') return false;
+
+  if (game.nextRoundTimer) {
+    clearTimeout(game.nextRoundTimer);
+    game.nextRoundTimer = null;
+  }
+
+  const safeName = String(playerName || 'A player').trim() || 'A player';
+  game.state = 'stopped';
+  io.to(code).emit('game_stopped', {
+    code,
+    stoppedByPlayerId: playerId || null,
+    stoppedByName: safeName,
+    reason,
+    message: `${safeName} stopped the game. Play a new game with your friend.`,
+    canReplayInRoom: true,
+  });
+
+  // The current hand must never continue after a real player exits. Removing
+  // the game object also makes the room immediately reusable for a new friend.
+  delete games[code];
+  return true;
 }
 
 function removePlayerAfterGrace(code, playerId) {
@@ -824,6 +857,7 @@ io.on('connection', (socket) => {
     }
 
     clearDisconnectTimer(code, playerId);
+    stopActiveGameForExit(code, playerId, player.name, 'player_left');
     player.connected = false;
     const gamePlayer = games[code]?.players.find((p) => p.playerId === playerId);
     if (gamePlayer) gamePlayer.connected = false;
@@ -996,6 +1030,13 @@ io.on('connection', (socket) => {
     if (fromDiscard) {
       if (game.discardPile.length === 0) {
         const response = { ok: false, message: 'Discard pile is empty.' };
+        socket.emit('game_error', response);
+        ack?.(response);
+        return;
+      }
+      const openCard = game.discardPile[game.discardPile.length - 1];
+      if (ruleIsJokerCard(openCard, game.wildJoker)) {
+        const response = { ok: false, message: 'Joker cannot be picked from the open deck. Draw from the closed deck.' };
         socket.emit('game_error', response);
         ack?.(response);
         return;
@@ -1290,12 +1331,20 @@ io.on('connection', (socket) => {
       const player = room.players.find((p) => p.id === socket.id);
       if (!player) continue;
 
+      const stoppedActiveGame = stopActiveGameForExit(code, player.playerId, player.name, 'connection_closed');
       player.connected = false;
       const gamePlayer = games[code]?.players.find((p) => p.playerId === player.playerId);
       if (gamePlayer) gamePlayer.connected = false;
       emitRoomUpdate(code);
 
       clearDisconnectTimer(code, player.playerId);
+      if (stoppedActiveGame) {
+        // During an active real-player game, a closed connection ends the hand
+        // immediately and frees the seat so the friend can start a fresh game.
+        removePlayerAfterGrace(code, player.playerId);
+        continue;
+      }
+
       const key = timerKey(code, player.playerId);
       const timer = setTimeout(() => {
         disconnectTimers.delete(key);
