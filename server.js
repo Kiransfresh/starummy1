@@ -434,16 +434,16 @@ function dealRound(game, incrementRound = true) {
     game.nextRoundTimer = null;
   }
   const deck = shuffle(buildTwoDecks());
-  const handsByPlayerId = {};
+  const handsByPlayerId = Object.fromEntries(game.players.map((player) => [player.playerId, []]));
+  const activePlayers = game.players.filter((player) => !isEliminated(game, player.playerId));
   let cursor = 0;
 
-  for (const player of game.players) {
-    if (isEliminated(game, player.playerId)) {
-      handsByPlayerId[player.playerId] = [];
-      continue;
+  // Real-table style distribution: one card per active seat per pass instead
+  // of giving 13-card blocks. Client hands are animated LEFT -> RIGHT.
+  for (let cardNo = 0; cardNo < 13; cardNo++) {
+    for (const player of activePlayers) {
+      handsByPlayerId[player.playerId].push(deck[cursor++]);
     }
-    handsByPlayerId[player.playerId] = deck.slice(cursor, cursor + 13);
-    cursor += 13;
   }
 
   const remaining = deck.slice(cursor);
@@ -627,8 +627,8 @@ function finishRound(code, details = {}) {
   const game = games[code];
   if (!game) return;
 
-  // Preserve the completed deal on the table scoreboard while the next deal
-  // is playing. This is sent to every client and survives reconnects.
+  // Preserve the completed round points for the round-result scoreboard.
+  // It is sent to every player and survives reconnects until the next round.
   game.lastRoundPointsByPlayerId = { ...game.roundPointsByPlayerId };
 
   const remaining = game.players.filter((player) => !isEliminated(game, player.playerId));
