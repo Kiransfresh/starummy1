@@ -1,11 +1,15 @@
-# Star Rummy 101 Railway Backend
+# Star Rummy 101 Railway Backend – 6 Player / 30s Score / Split
 
-This backend matches the Left Deal + Round Scoreboard client build.
+Deploy these files at the root of the GitHub repository connected to Railway.
 
-Changes:
-- room dealing uses one-card-per-seat round-robin distribution;
-- round results are emitted to every connected player;
-- reconnecting players can receive the active round result;
-- existing 101 Pool Joker and room-stop logic remains included.
+Included server behavior:
+- fixed six-seat 101 Pool rooms,
+- clockwise/right-side turn order,
+- exactly 30-second post-declaration score window,
+- authoritative score submission and auto-finalization,
+- complete round history synchronization,
+- automatic 3-player / 2-player split eligibility,
+- unanimous split confirmation with exact pool arithmetic,
+- existing Joker / drop / reconnect / finish rules.
 
-Deploy the files in this folder to the GitHub repository connected to Railway, then redeploy the Railway service.
+Railway uses `Dockerfile` and `railway-package.json`; no frontend `src/` directory is required by the backend container.

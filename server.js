@@ -251,6 +251,9 @@ const io = new Server(httpServer, {
 const MAX_PLAYERS = 6;
 const RECONNECT_GRACE_MS = 45_000;
 const START_COUNTDOWN_SECONDS = 3;
+const SCORE_WINDOW_SECONDS = 30;
+const ROUND_RESULT_SECONDS = 6;
+const SPLIT_COUNTS = new Set([2, 3]);
 
 function normaliseTableSize(value) {
   return Number(value) === 2 ? 2 : MAX_PLAYERS;
@@ -408,6 +411,8 @@ function isRoundActive(game, player) {
     && !game.droppedPlayerIds.has(player.playerId);
 }
 
+// Seat order is clockwise around the table. Moving +1 therefore moves to the
+// player on the current player's RIGHT, which is the required 101 Pool turn direction.
 function nextPlayableIndex(game, fromIndex) {
   if (!game.players.length) return -1;
   for (let offset = 1; offset <= game.players.length; offset += 1) {
@@ -422,6 +427,67 @@ function activeRoundPlayers(game) {
   return game.players.filter((player) => isRoundActive(game, player));
 }
 
+function activeGamePlayers(game) {
+  return game.players.filter((player) => !isEliminated(game, player.playerId));
+}
+
+function safePoolAmount(game) {
+  return Math.max(0, Number(game.poolAmount) || 0);
+}
+
+function buildSplitOffer(game) {
+  const remaining = activeGamePlayers(game);
+  if (!SPLIT_COUNTS.has(remaining.length) || game.splitFinalized) return null;
+  const poolAmount = safePoolAmount(game);
+  if (poolAmount <= 0) return null;
+
+  // Work in paise so the total can never exceed or fall short of the pool.
+  const poolPaise = Math.round(poolAmount * 100);
+  if (poolPaise % remaining.length !== 0) return null;
+  const sharePaise = poolPaise / remaining.length;
+  const confirmed = game.splitConfirmedPlayerIds || new Set();
+  return {
+    eligible: true,
+    playerCount: remaining.length,
+    poolAmount: poolPaise / 100,
+    shareAmount: sharePaise / 100,
+    playerIds: remaining.map((player) => player.playerId),
+    confirmedPlayerIds: remaining.filter((player) => confirmed.has(player.playerId)).map((player) => player.playerId),
+    requiresAllPlayers: true,
+  };
+}
+
+function roundHistoryEntry(game, details = {}) {
+  const winnerPlayerId = details.roundWinnerPlayerId || game.roundWinnerPlayerId || null;
+  return {
+    roundNumber: game.roundNumber || 1,
+    winnerPlayerId,
+    reason: details.reason || 'round_over',
+    message: details.message || 'Round completed.',
+    finalizedAt: Date.now(),
+    players: game.players.map((player) => {
+      const roundScore = game.roundPointsByPlayerId[player.playerId] || 0;
+      const totalScore = game.scoresByPlayerId[player.playerId] || 0;
+      return {
+        playerId: player.playerId,
+        seatIndex: player.seatIndex ?? game.players.indexOf(player),
+        name: player.name,
+        roundScore,
+        previousScore: Math.max(0, totalScore - roundScore),
+        totalScore,
+        status: player.playerId === winnerPlayerId
+          ? 'ROUND WINNER'
+          : isEliminated(game, player.playerId)
+            ? 'ELIMINATED'
+            : game.droppedPlayerIds.has(player.playerId)
+              ? 'DROPPED'
+              : 'ACTIVE',
+      };
+    }),
+    split: game.splitFinalized ? game.splitResult || null : null,
+  };
+}
+
 function addPoints(game, playerId, points) {
   const safePoints = Math.max(0, Math.min(80, Number(points) || 0));
   game.scoresByPlayerId[playerId] = (game.scoresByPlayerId[playerId] || 0) + safePoints;
@@ -432,6 +498,10 @@ function dealRound(game, incrementRound = true) {
   if (game.nextRoundTimer) {
     clearTimeout(game.nextRoundTimer);
     game.nextRoundTimer = null;
+  }
+  if (game.scoreWindowTimer) {
+    clearTimeout(game.scoreWindowTimer);
+    game.scoreWindowTimer = null;
   }
   const deck = shuffle(buildTwoDecks());
   const handsByPlayerId = Object.fromEntries(game.players.map((player) => [player.playerId, []]));
@@ -467,6 +537,11 @@ function dealRound(game, incrementRound = true) {
   game.roundNumber = incrementRound ? (game.roundNumber || 0) + 1 : (game.roundNumber || 1);
   game.state = 'playing';
   game.winnerPlayerId = null;
+  game.roundWinnerPlayerId = null;
+  game.scoreWindowEndsAt = null;
+  game.pendingScoreSubmissions = {};
+  game.submittedScorePlayerIds = new Set();
+  game.splitConfirmedPlayerIds = new Set();
   game.lastRoundDetails = null;
 
   const startingFrom = Number.isInteger(game.dealerIndex) ? game.dealerIndex : -1;
@@ -480,6 +555,7 @@ function publicPlayers(players) {
     playerId: p.playerId,
     name: p.name,
     connected: p.connected !== false,
+    seatIndex: p.seatIndex ?? null,
   }));
 }
 
@@ -542,6 +618,7 @@ function buildSnapshot(game, forPlayerId) {
     playerId: p.playerId,
     name: p.name,
     connected: p.connected !== false,
+    seatIndex: p.seatIndex ?? game.players.indexOf(p),
     handSize: (game.handsByPlayerId[p.playerId] || []).length,
     score: game.scoresByPlayerId[p.playerId] || 0,
     roundPoints: game.roundPointsByPlayerId[p.playerId] || 0,
@@ -549,6 +626,7 @@ function buildSnapshot(game, forPlayerId) {
     lastDiscard: game.lastDiscardByPlayerId?.[p.playerId] || null,
     dropped: game.droppedPlayerIds.has(p.playerId),
     isEliminated: isEliminated(game, p.playerId),
+    scoreSubmitted: game.submittedScorePlayerIds?.has(p.playerId) || false,
   }));
 
   const current = game.state === 'playing' ? (game.players[game.turnIndex] || null) : null;
@@ -566,6 +644,15 @@ function buildSnapshot(game, forPlayerId) {
     roundNumber: game.roundNumber || 1,
     dealerIndex: game.dealerIndex ?? 0,
     winnerPlayerId: game.winnerPlayerId || null,
+    roundWinnerPlayerId: game.roundWinnerPlayerId || null,
+    scoreWindowEndsAt: game.scoreWindowEndsAt || null,
+    scoreWindowSeconds: SCORE_WINDOW_SECONDS,
+    submittedScorePlayerIds: [...(game.submittedScorePlayerIds || new Set())],
+    roundHistory: [...(game.roundHistory || [])],
+    poolAmount: safePoolAmount(game),
+    splitOffer: buildSplitOffer(game),
+    splitFinalized: !!game.splitFinalized,
+    splitResult: game.splitResult || null,
     lastAction: game.lastAction || null,
   };
 }
@@ -602,7 +689,13 @@ function buildRoundResult(code, game, forPlayerId, details = {}) {
     validDeclaration: details.validDeclaration ?? null,
     roundWinnerPlayerId: details.roundWinnerPlayerId || null,
     winnerPlayerId: game.winnerPlayerId || null,
-    nextRoundInSeconds: game.state === 'round_over' ? 5 : null,
+    nextRoundInSeconds: game.state === 'round_over' ? ROUND_RESULT_SECONDS : null,
+    scoreWindowEndsAt: game.scoreWindowEndsAt || null,
+    roundHistory: [...(game.roundHistory || [])],
+    poolAmount: safePoolAmount(game),
+    splitOffer: buildSplitOffer(game),
+    splitFinalized: !!game.splitFinalized,
+    splitResult: game.splitResult || null,
     scoresByPlayerId: { ...game.scoresByPlayerId },
     roundPointsByPlayerId: { ...game.roundPointsByPlayerId },
     lastRoundPointsByPlayerId: { ...(game.lastRoundPointsByPlayerId || game.roundPointsByPlayerId) },
@@ -613,6 +706,7 @@ function buildRoundResult(code, game, forPlayerId, details = {}) {
       playerId: player.playerId,
       name: player.name,
       connected: player.connected !== false,
+      seatIndex: player.seatIndex ?? game.players.indexOf(player),
       score: game.scoresByPlayerId[player.playerId] || 0,
       roundPoints: game.roundPointsByPlayerId[player.playerId] || 0,
       lastRoundPoints: game.roundPointsByPlayerId[player.playerId] || 0,
@@ -627,14 +721,23 @@ function finishRound(code, details = {}) {
   const game = games[code];
   if (!game) return;
 
-  // Preserve the completed round points for the round-result scoreboard.
-  // It is sent to every player and survives reconnects until the next round.
-  game.lastRoundPointsByPlayerId = { ...game.roundPointsByPlayerId };
+  if (game.scoreWindowTimer) {
+    clearTimeout(game.scoreWindowTimer);
+    game.scoreWindowTimer = null;
+  }
+  game.scoreWindowEndsAt = null;
+  game.roundWinnerPlayerId = details.roundWinnerPlayerId || game.roundWinnerPlayerId || null;
 
-  const remaining = game.players.filter((player) => !isEliminated(game, player.playerId));
-  if (remaining.length === 1) {
+  // Preserve the completed round points and append immutable history before
+  // the next deal resets roundPointsByPlayerId.
+  game.lastRoundPointsByPlayerId = { ...game.roundPointsByPlayerId };
+  game.roundHistory = game.roundHistory || [];
+  game.roundHistory.push(roundHistoryEntry(game, details));
+
+  const remaining = activeGamePlayers(game);
+  if (remaining.length <= 1) {
     game.state = 'finished';
-    game.winnerPlayerId = remaining[0].playerId;
+    game.winnerPlayerId = remaining[0]?.playerId || game.roundWinnerPlayerId || null;
   } else {
     game.state = 'round_over';
     game.winnerPlayerId = null;
@@ -647,15 +750,130 @@ function finishRound(code, details = {}) {
   }
   broadcastGameState(code);
 
-  if (game.state === 'round_over') {
+  // If only 3 or 2 players remain, keep the result screen open so every
+  // remaining player has a fair chance to review/confirm the optional split.
+  // Otherwise the normal short result pause advances to the next round.
+  if (game.state === 'round_over' && !buildSplitOffer(game)) {
     game.nextRoundTimer = setTimeout(() => {
       const current = games[code];
-      if (!current || current.state !== 'round_over') return;
+      if (!current || current.state !== 'round_over' || current.splitFinalized) return;
       dealRound(current);
       io.to(code).emit('round_started', { code, roundNumber: current.roundNumber });
       broadcastGameState(code);
-    }, 5_000);
+    }, ROUND_RESULT_SECONDS * 1000);
   }
+}
+
+function finalizeScoreWindow(code) {
+  const game = games[code];
+  if (!game || game.state !== 'score_window') return;
+  if (game.scoreWindowTimer) {
+    clearTimeout(game.scoreWindowTimer);
+    game.scoreWindowTimer = null;
+  }
+
+  const winnerId = game.roundWinnerPlayerId;
+  for (const player of game.players) {
+    if (player.playerId === winnerId) continue;
+    if (game.droppedPlayerIds.has(player.playerId)) continue; // drop/wrong-show penalty already recorded
+    if (isEliminated(game, player.playerId)) continue;
+    const submitted = game.pendingScoreSubmissions?.[player.playerId];
+    const score = Number.isFinite(submitted)
+      ? submitted
+      : calculateDeadwood(game.handsByPlayerId[player.playerId] || [], game.wildJoker);
+    addPoints(game, player.playerId, score);
+  }
+
+  const details = game.pendingRoundDetails || {
+    reason: 'valid_declaration',
+    message: 'The 30-second score window ended.',
+    roundWinnerPlayerId: winnerId,
+  };
+  game.pendingRoundDetails = null;
+  finishRound(code, { ...details, scoreWindowFinalized: true });
+}
+
+function beginScoreWindow(code, details = {}) {
+  const game = games[code];
+  if (!game) return;
+  if (game.nextRoundTimer) {
+    clearTimeout(game.nextRoundTimer);
+    game.nextRoundTimer = null;
+  }
+  if (game.scoreWindowTimer) clearTimeout(game.scoreWindowTimer);
+
+  game.state = 'score_window';
+  game.roundWinnerPlayerId = details.roundWinnerPlayerId || details.declarerPlayerId || null;
+  game.pendingRoundDetails = { ...details };
+  game.pendingScoreSubmissions = {};
+  game.submittedScorePlayerIds = new Set(game.roundWinnerPlayerId ? [game.roundWinnerPlayerId] : []);
+  game.scoreWindowEndsAt = Date.now() + SCORE_WINDOW_SECONDS * 1000;
+
+  const requiredPlayerIds = game.players
+    .filter((player) => player.playerId !== game.roundWinnerPlayerId)
+    .filter((player) => !game.droppedPlayerIds.has(player.playerId))
+    .filter((player) => !isEliminated(game, player.playerId))
+    .map((player) => player.playerId);
+
+  io.to(code).emit('score_window_started', {
+    code,
+    roundNumber: game.roundNumber || 1,
+    winnerPlayerId: game.roundWinnerPlayerId,
+    scoreWindowEndsAt: game.scoreWindowEndsAt,
+    seconds: SCORE_WINDOW_SECONDS,
+    requiredPlayerIds,
+    submittedPlayerIds: [...game.submittedScorePlayerIds],
+    message: 'Winner declared. Other players have 30 seconds to submit their round score.',
+  });
+  broadcastGameState(code);
+
+  game.scoreWindowTimer = setTimeout(() => finalizeScoreWindow(code), SCORE_WINDOW_SECONDS * 1000);
+}
+
+function finalizeSplit(code) {
+  const game = games[code];
+  if (!game || game.splitFinalized) return false;
+  const offer = buildSplitOffer(game);
+  if (!offer) return false;
+  const confirmed = game.splitConfirmedPlayerIds || new Set();
+  if (!offer.playerIds.every((playerId) => confirmed.has(playerId))) return false;
+
+  if (game.nextRoundTimer) {
+    clearTimeout(game.nextRoundTimer);
+    game.nextRoundTimer = null;
+  }
+  game.splitFinalized = true;
+  game.state = 'finished';
+  game.winnerPlayerId = null;
+  game.splitResult = {
+    poolAmount: offer.poolAmount,
+    shareAmount: offer.shareAmount,
+    playerIds: [...offer.playerIds],
+    finalizedAt: Date.now(),
+  };
+
+  game.roundHistory = game.roundHistory || [];
+  game.roundHistory.push({
+    type: 'split',
+    roundNumber: game.roundNumber || 1,
+    finalizedAt: Date.now(),
+    poolAmount: offer.poolAmount,
+    shareAmount: offer.shareAmount,
+    playerIds: [...offer.playerIds],
+  });
+
+  io.to(code).emit('split_finalized', { code, ...game.splitResult });
+  game.lastRoundDetails = {
+    reason: 'split_finalized',
+    message: `Pool split confirmed. Each remaining player receives ${offer.shareAmount}.`,
+    roundWinnerPlayerId: game.roundWinnerPlayerId || null,
+  };
+  for (const player of game.players) {
+    if (!player.connected || !player.id) continue;
+    io.to(player.id).emit('round_result', buildRoundResult(code, game, player.playerId, game.lastRoundDetails));
+  }
+  broadcastGameState(code);
+  return true;
 }
 
 function stopActiveGameForExit(code, playerId, playerName, reason = 'left') {
@@ -665,6 +883,10 @@ function stopActiveGameForExit(code, playerId, playerName, reason = 'left') {
   if (game.nextRoundTimer) {
     clearTimeout(game.nextRoundTimer);
     game.nextRoundTimer = null;
+  }
+  if (game.scoreWindowTimer) {
+    clearTimeout(game.scoreWindowTimer);
+    game.scoreWindowTimer = null;
   }
 
   const safeName = String(playerName || 'A player').trim() || 'A player';
@@ -971,8 +1193,9 @@ io.on('connection', (socket) => {
     }
 
     const connectedPlayers = room.players.filter((p) => p.connected !== false);
-    if (connectedPlayers.length < 2) {
-      const response = { ok: false, message: 'At least 2 connected players are required.' };
+    const requiredPlayers = normaliseTableSize(room.tableSize);
+    if (connectedPlayers.length < requiredPlayers) {
+      const response = { ok: false, message: requiredPlayers === 6 ? 'This is a 6-player table. All 6 players must be seated before the host starts.' : 'Both players must be connected before the host starts.' };
       socket.emit('game_error', response);
       ack?.(response);
       return;
@@ -992,9 +1215,9 @@ io.on('connection', (socket) => {
       const currentRoom = rooms[code];
       const players = currentRoom.players
         .filter((p) => p.connected !== false)
-        .map((p) => ({ ...p }));
-      if (players.length < 2) {
-        io.to(code).emit('game_error', { message: 'A player disconnected before the game started.' });
+        .map((p, seatIndex) => ({ ...p, seatIndex }));
+      if (players.length < normaliseTableSize(currentRoom.tableSize)) {
+        io.to(code).emit('game_error', { message: 'A player disconnected before all required seats were ready.' });
         return;
       }
 
@@ -1010,6 +1233,16 @@ io.on('connection', (socket) => {
         winnerPlayerId: null,
         actionSequence: 0,
         lastAction: null,
+        roundHistory: [],
+        roundWinnerPlayerId: null,
+        scoreWindowEndsAt: null,
+        scoreWindowTimer: null,
+        pendingScoreSubmissions: {},
+        submittedScorePlayerIds: new Set(),
+        splitConfirmedPlayerIds: new Set(),
+        splitFinalized: false,
+        splitResult: null,
+        poolAmount: Math.max(0, Number(currentRoom.entryFee) || 0) * players.length,
       };
       games[code] = game;
       dealRound(game);
@@ -1308,19 +1541,88 @@ io.on('connection', (socket) => {
       return;
     }
 
-    for (const player of game.players) {
-      if (game.droppedPlayerIds.has(player.playerId) || player.playerId === actor.playerId) continue;
-      addPoints(game, player.playerId, calculateDeadwood(game.handsByPlayerId[player.playerId] || [], game.wildJoker));
-    }
-
-    finishRound(code, {
+    beginScoreWindow(code, {
       reason: 'valid_declaration',
-      message: `${actor.name} made a valid declaration.`,
+      message: `${actor.name} made a valid declaration. 30-second score submission window started.`,
       declarerPlayerId: actor.playerId,
       validDeclaration: true,
       roundWinnerPlayerId: actor.playerId,
     });
-    ack?.({ ok: true, valid: true, roundOver: true, reason: verdict.reason });
+    ack?.({
+      ok: true,
+      valid: true,
+      roundOver: false,
+      scoreWindow: true,
+      scoreWindowEndsAt: game.scoreWindowEndsAt,
+      reason: verdict.reason,
+    });
+  });
+
+  socket.on('submit_round_score', (payload = {}, ack) => {
+    const code = normaliseCode(payload.code);
+    const playerId = String(payload.playerId || '').trim();
+    const game = games[code];
+    if (!game || game.state !== 'score_window') {
+      ack?.({ ok: false, message: 'The score window is not open.' });
+      return;
+    }
+    if (!game.scoreWindowEndsAt || Date.now() >= game.scoreWindowEndsAt) {
+      ack?.({ ok: false, message: 'The 30-second score window has expired.' });
+      return;
+    }
+    const actor = findGamePlayer(game, playerId, socket.id);
+    if (!actor) {
+      ack?.({ ok: false, message: 'Player is not part of this game.' });
+      return;
+    }
+    if (actor.playerId === game.roundWinnerPlayerId) {
+      ack?.({ ok: false, message: 'The round winner has 0 points and does not submit a score.' });
+      return;
+    }
+    if (game.droppedPlayerIds.has(actor.playerId)) {
+      ack?.({ ok: false, message: 'Your drop/wrong-show penalty is already locked for this round.' });
+      return;
+    }
+    if (game.submittedScorePlayerIds?.has(actor.playerId)) {
+      ack?.({ ok: true, alreadySubmitted: true, score: game.pendingScoreSubmissions?.[actor.playerId] ?? 0 });
+      return;
+    }
+
+    const score = calculateDeadwood(game.handsByPlayerId[actor.playerId] || [], game.wildJoker);
+    game.pendingScoreSubmissions[actor.playerId] = score;
+    game.submittedScorePlayerIds.add(actor.playerId);
+    const event = {
+      code,
+      playerId: actor.playerId,
+      score,
+      submittedPlayerIds: [...game.submittedScorePlayerIds],
+      scoreWindowEndsAt: game.scoreWindowEndsAt,
+    };
+    io.to(code).emit('score_submitted', event);
+    broadcastGameState(code);
+    ack?.({ ok: true, score, scoreWindowEndsAt: game.scoreWindowEndsAt });
+  });
+
+  socket.on('confirm_split', (payload = {}, ack) => {
+    const code = normaliseCode(payload.code);
+    const playerId = String(payload.playerId || '').trim();
+    const game = games[code];
+    if (!game || game.state !== 'round_over' || game.splitFinalized) {
+      ack?.({ ok: false, message: 'Split is not available right now.' });
+      return;
+    }
+    const actor = findGamePlayer(game, playerId, socket.id);
+    const offer = buildSplitOffer(game);
+    if (!actor || !offer || !offer.playerIds.includes(actor.playerId)) {
+      ack?.({ ok: false, message: 'You are not eligible for this split.' });
+      return;
+    }
+    game.splitConfirmedPlayerIds = game.splitConfirmedPlayerIds || new Set();
+    game.splitConfirmedPlayerIds.add(actor.playerId);
+    const updated = buildSplitOffer(game);
+    io.to(code).emit('split_update', { code, splitOffer: updated });
+    const finalized = finalizeSplit(code);
+    ack?.({ ok: true, finalized, splitOffer: finalized ? null : updated, splitResult: game.splitResult || null });
   });
 
   socket.on('start_next_round', (payload = {}, ack) => {

@@ -1,28 +1,18 @@
-STAR RUMMY 101 - SCOREBOARD + JOKER FINAL QA
-============================================
+STAR RUMMY 101 – FINAL 6 PLAYER LIVE FLOW QA
+Date: 2026-08-26
 
-RESULT: PASS
+PASS: 40/40 automated tests
+PASS: 6-client live integration test
+  - six fixed seat indexes: 0,1,2,3,4,5
+  - full 6-player start requirement
+  - ₹100 entry × 6 = ₹600 authoritative pool
+  - 13 cards per player
+  - Seat 1 draw/discard -> turn advances to Seat 2 on the right
+PASS: existing 2-player room lifecycle regression test
+PASS: Joker / 101 declaration / drag-drop / finish-confirmation / wallet regressions
+PASS: server.js Node syntax check
+PASS: 43 JS/JSX/MJS application/server files parsed successfully with Babel parser
+PASS: Railway health endpoint returns { ok: true }
 
-Automated tests: 30/30 PASS
-- 101 Pool scoring and penalties
-- Numeric/letter/printed Joker indicator handling
-- Numeric wild Joker draw from CLOSED deck
-- Joker blocked from OPEN discard pile
-- Wild Joker natural pure-sequence rule
-- Finish YES/NO glass confirmation
-- Drag/drop behavior
-- Premium scoreboard present on table
-- Same scoreboard reused for round/final result
-- Previous round points persist into next round
-- Multiplayer create/join/draw/discard/drop/declare/reconnect/next-round
-- Previous round points synchronized by Railway server
-- Active-room stop behavior
-- Wallet/subscription regressions
-
-Syntax validation:
-- 51 JS/JSX/MJS files parsed
-- 0 parse errors
-- server.js node syntax check PASS
-
-Production build note:
-The cached dependency folder available in the Linux QA environment came from a Windows project and does not contain the Linux Rollup native optional package. The final ZIP excludes node_modules. Run npm install on Windows before npm run build.
+Production Vite bundle note:
+The project source and automated tests are valid. A full Vite bundle was not executed in this Linux sandbox because the available dependency cache contains the Windows Rollup native package and outbound npm access is unavailable. The included Windows build script/npm commands install the correct platform dependency on the user's VS Code/Windows environment before Android sync.
