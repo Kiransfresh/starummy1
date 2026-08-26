@@ -647,6 +647,13 @@ function buildSnapshot(game, forPlayerId) {
     roundWinnerPlayerId: game.roundWinnerPlayerId || null,
     scoreWindowEndsAt: game.scoreWindowEndsAt || null,
     scoreWindowSeconds: SCORE_WINDOW_SECONDS,
+    requiredScorePlayerIds: game.state === 'score_window'
+      ? game.players
+          .filter((player) => player.playerId !== game.roundWinnerPlayerId)
+          .filter((player) => !game.droppedPlayerIds.has(player.playerId))
+          .filter((player) => !isEliminated(game, player.playerId))
+          .map((player) => player.playerId)
+      : [],
     submittedScorePlayerIds: [...(game.submittedScorePlayerIds || new Set())],
     roundHistory: [...(game.roundHistory || [])],
     poolAmount: safePoolAmount(game),
@@ -700,6 +707,11 @@ function buildRoundResult(code, game, forPlayerId, details = {}) {
     roundPointsByPlayerId: { ...game.roundPointsByPlayerId },
     lastRoundPointsByPlayerId: { ...(game.lastRoundPointsByPlayerId || game.roundPointsByPlayerId) },
     hand: [...(game.handsByPlayerId[forPlayerId] || [])],
+    // Hands are revealed only in the completed round result so every client
+    // receives the same reference-style scoreboard without leaking live cards.
+    revealedHandsByPlayerId: Object.fromEntries(
+      game.players.map((player) => [player.playerId, [...(game.handsByPlayerId[player.playerId] || [])]]),
+    ),
     wildJoker: game.wildJoker || null,
     players: game.players.map((player) => ({
       id: player.id,
@@ -819,11 +831,12 @@ function beginScoreWindow(code, details = {}) {
     code,
     roundNumber: game.roundNumber || 1,
     winnerPlayerId: game.roundWinnerPlayerId,
+    scoreWindowStartedAt: game.scoreWindowEndsAt - SCORE_WINDOW_SECONDS * 1000,
     scoreWindowEndsAt: game.scoreWindowEndsAt,
     seconds: SCORE_WINDOW_SECONDS,
     requiredPlayerIds,
     submittedPlayerIds: [...game.submittedScorePlayerIds],
-    message: 'Winner declared. Other players have 30 seconds to submit their round score.',
+    message: 'Winner declared. Group your cards and commit your score before the 30-second timer reaches 0.',
   });
   broadcastGameState(code);
 

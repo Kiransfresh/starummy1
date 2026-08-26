@@ -1,0 +1,8 @@
+FINAL DECLARATION QA
+- Exact server score window: 30 seconds
+- Score window never finalizes early on submit
+- Late score submissions rejected
+- Required/submitted score player ids survive reconnect snapshot
+- All completed hands revealed only in round_result
+- Same round scoreboard data sent to every connected player
+- server.js node syntax: PASS
