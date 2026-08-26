@@ -252,7 +252,7 @@ const MAX_PLAYERS = 6;
 const RECONNECT_GRACE_MS = 45_000;
 const START_COUNTDOWN_SECONDS = 3;
 const SCORE_WINDOW_SECONDS = 30;
-const ROUND_RESULT_SECONDS = 6;
+const ROUND_RESULT_SECONDS = 8;
 const SPLIT_COUNTS = new Set([2, 3]);
 
 function normaliseTableSize(value) {
@@ -647,6 +647,7 @@ function buildSnapshot(game, forPlayerId) {
     roundWinnerPlayerId: game.roundWinnerPlayerId || null,
     scoreWindowEndsAt: game.scoreWindowEndsAt || null,
     scoreWindowSeconds: SCORE_WINDOW_SECONDS,
+    scoreWindowSecondsRemaining: game.scoreWindowEndsAt ? Math.max(0, Math.ceil((game.scoreWindowEndsAt - Date.now()) / 1000)) : null,
     requiredScorePlayerIds: game.state === 'score_window'
       ? game.players
           .filter((player) => player.playerId !== game.roundWinnerPlayerId)
@@ -737,6 +738,10 @@ function finishRound(code, details = {}) {
     clearTimeout(game.scoreWindowTimer);
     game.scoreWindowTimer = null;
   }
+  if (game.scoreWindowInterval) {
+    clearInterval(game.scoreWindowInterval);
+    game.scoreWindowInterval = null;
+  }
   game.scoreWindowEndsAt = null;
   game.roundWinnerPlayerId = details.roundWinnerPlayerId || game.roundWinnerPlayerId || null;
 
@@ -783,6 +788,10 @@ function finalizeScoreWindow(code) {
     clearTimeout(game.scoreWindowTimer);
     game.scoreWindowTimer = null;
   }
+  if (game.scoreWindowInterval) {
+    clearInterval(game.scoreWindowInterval);
+    game.scoreWindowInterval = null;
+  }
 
   const winnerId = game.roundWinnerPlayerId;
   for (const player of game.players) {
@@ -813,6 +822,7 @@ function beginScoreWindow(code, details = {}) {
     game.nextRoundTimer = null;
   }
   if (game.scoreWindowTimer) clearTimeout(game.scoreWindowTimer);
+  if (game.scoreWindowInterval) clearInterval(game.scoreWindowInterval);
 
   game.state = 'score_window';
   game.roundWinnerPlayerId = details.roundWinnerPlayerId || details.declarerPlayerId || null;
@@ -840,6 +850,27 @@ function beginScoreWindow(code, details = {}) {
   });
   broadcastGameState(code);
 
+  // Server-authoritative 30 → 0 declaration countdown for every device.
+  const emitScoreWindowTick = () => {
+    const current = games[code];
+    if (!current || current.state !== 'score_window' || !current.scoreWindowEndsAt) return;
+    const seconds = Math.max(0, Math.ceil((current.scoreWindowEndsAt - Date.now()) / 1000));
+    io.to(code).emit('score_window_tick', {
+      code,
+      roundNumber: current.roundNumber || 1,
+      winnerPlayerId: current.roundWinnerPlayerId,
+      scoreWindowEndsAt: current.scoreWindowEndsAt,
+      seconds,
+      requiredPlayerIds,
+      submittedPlayerIds: [...(current.submittedScorePlayerIds || new Set())],
+    });
+    if (seconds <= 0 && current.scoreWindowInterval) {
+      clearInterval(current.scoreWindowInterval);
+      current.scoreWindowInterval = null;
+    }
+  };
+  emitScoreWindowTick();
+  game.scoreWindowInterval = setInterval(emitScoreWindowTick, 1000);
   game.scoreWindowTimer = setTimeout(() => finalizeScoreWindow(code), SCORE_WINDOW_SECONDS * 1000);
 }
 
@@ -1250,6 +1281,7 @@ io.on('connection', (socket) => {
         roundWinnerPlayerId: null,
         scoreWindowEndsAt: null,
         scoreWindowTimer: null,
+        scoreWindowInterval: null,
         pendingScoreSubmissions: {},
         submittedScorePlayerIds: new Set(),
         splitConfirmedPlayerIds: new Set(),

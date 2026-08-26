@@ -1,8 +1,14 @@
-FINAL DECLARATION QA
-- Exact server score window: 30 seconds
-- Score window never finalizes early on submit
-- Late score submissions rejected
-- Required/submitted score player ids survive reconnect snapshot
-- All completed hands revealed only in round_result
-- Same round scoreboard data sent to every connected player
-- server.js node syntax: PASS
+Focused QA completed after the final declaration/UI patch:
+- 41 dependency-free game/rule/UI source tests passed before packaging.
+- Exact 30-second server score-window source test passed.
+- Immediate declare-ACK timer test passed.
+- Server tick synchronization test passed.
+- Practice 30-second flow test passed.
+- Result width/card clarity/animated score percentage test passed.
+- Multiplayer revealed-hand playerId mapping test passed.
+- Joker, pure-sequence, finish confirmation, drag/drop, deal direction, 6-player pool flow and scoreboard tests passed.
+- server.js passes `node --check`.
+- src/services/gameSocket.js passes `node --check`.
+- scripts/fix-android-build.cjs passes `node --check`.
+
+Full Vite/Android compilation must run on Windows with project npm dependencies. The provided Gradle wrapper now rebuilds/copies current web assets automatically for assemble/install/bundle tasks to prevent stale APK content.
