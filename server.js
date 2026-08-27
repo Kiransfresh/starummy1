@@ -256,7 +256,14 @@ const ROUND_RESULT_SECONDS = 8;
 const SPLIT_COUNTS = new Set([2, 3]);
 
 function normaliseTableSize(value) {
-  return Number(value) === 2 ? 2 : MAX_PLAYERS;
+  const parsed = Math.floor(Number(value) || MAX_PLAYERS);
+  return Math.max(2, Math.min(MAX_PLAYERS, parsed));
+}
+
+function normaliseMinPlayers(value, tableSize = MAX_PLAYERS) {
+  const maxSeats = normaliseTableSize(tableSize);
+  const parsed = Math.floor(Number(value) || 2);
+  return Math.max(2, Math.min(maxSeats, parsed));
 }
 
 // { code: { host, hostPlayerId, players: [{ id, playerId, name, connected }] } }
@@ -300,6 +307,82 @@ function shuffle(deck) {
     [d[i], d[j]] = [d[j], d[i]];
   }
   return d;
+}
+
+function seatingRankValue(rank) {
+  if (rank === 'A') return 14;
+  if (rank === 'K') return 13;
+  if (rank === 'Q') return 12;
+  if (rank === 'J') return 11;
+  return Number(rank) || 0;
+}
+
+function createSeatingDraw(players = []) {
+  // Every real player draws from one shuffled natural deck. Equal ranks are
+  // resolved by drawing again so seating order is unambiguous. Ace is high.
+  // Seat positions are NOT assigned here: the highest-card player must choose
+  // the physical seat before the remaining players are placed to the right.
+  const deck = shuffle(buildDeck(5000).filter((card) => RANKS.includes(card.rank)));
+  const usedRanks = new Set();
+  const picks = [];
+  for (const player of players) {
+    let card = null;
+    while (deck.length && !card) {
+      const candidate = deck.shift();
+      if (!usedRanks.has(candidate.rank)) card = candidate;
+    }
+    if (!card) card = { id: `SEAT_${player.playerId}`, rank: '2', suit: 'C' };
+    usedRanks.add(card.rank);
+    picks.push({ player, card });
+  }
+
+  picks.sort((a, b) => seatingRankValue(b.card.rank) - seatingRankValue(a.card.rank));
+  return picks.map(({ player, card }, rankOrder) => ({
+    ...player,
+    rankOrder,
+    seatIndex: null,
+    seatingCard: { id: card.id, rank: card.rank, suit: card.suit },
+    hasCrown: rankOrder === 0,
+  }));
+}
+
+function seatingDrawPayload(players = []) {
+  return [...players]
+    .sort((a, b) => (a.rankOrder ?? 99) - (b.rankOrder ?? 99))
+    .map((p) => ({
+      playerId: p.playerId,
+      name: p.name,
+      rankOrder: p.rankOrder ?? null,
+      seatIndex: p.seatIndex ?? null,
+      card: p.seatingCard || null,
+      hasCrown: !!p.hasCrown,
+    }));
+}
+
+function finalizeSeatingChoice(room, chosenSeatIndex = 0) {
+  if (!room) return [];
+  const maxSeats = normaliseTableSize(room.tableSize);
+  const pending = (room.pendingSeatingOrder || room.players || [])
+    .filter((p) => p.connected !== false)
+    .sort((a, b) => (a.rankOrder ?? 99) - (b.rankOrder ?? 99));
+  if (!pending.length) return [];
+
+  const chosen = Math.max(0, Math.min(maxSeats - 1, Math.trunc(Number(chosenSeatIndex) || 0)));
+  const seated = pending.map((player, rankOrder) => ({
+    ...player,
+    rankOrder,
+    // Next-highest goes to the right; continuing clockwise makes the lowest
+    // the occupied seat immediately to the highest player's left.
+    seatIndex: (chosen + rankOrder) % maxSeats,
+    hasCrown: rankOrder === 0,
+  }));
+
+  room.players = seated.sort((a, b) => (a.seatIndex ?? 99) - (b.seatIndex ?? 99));
+  room.pendingSeatingOrder = null;
+  room.seatChoiceRequiredPlayerId = null;
+  room.highCardPlayerId = seated.find((p) => p.rankOrder === 0)?.playerId || null;
+  room.initialDealerPlayerId = seated.find((p) => p.rankOrder === seated.length - 1)?.playerId || null;
+  return room.players;
 }
 
 function selectWildJokerIndex(cards = [], random = Math.random) {
@@ -534,19 +617,31 @@ function dealRound(game, incrementRound = true) {
     game.lastRoundPointsByPlayerId = Object.fromEntries(game.players.map((player) => [player.playerId, 0]));
   }
   game.roundPointsByPlayerId = Object.fromEntries(game.players.map((player) => [player.playerId, 0]));
-  game.roundNumber = incrementRound ? (game.roundNumber || 0) + 1 : (game.roundNumber || 1);
+  const previousRoundNumber = game.roundNumber || 0;
+  game.roundNumber = incrementRound ? previousRoundNumber + 1 : (previousRoundNumber || 1);
   game.state = 'playing';
   game.winnerPlayerId = null;
   game.roundWinnerPlayerId = null;
+  game.declarationPlayerId = null;
+  game.declarationSubmitted = false;
+  game.scoreWindowStage = null;
   game.scoreWindowEndsAt = null;
   game.pendingScoreSubmissions = {};
   game.submittedScorePlayerIds = new Set();
   game.splitConfirmedPlayerIds = new Set();
   game.lastRoundDetails = null;
 
-  const startingFrom = Number.isInteger(game.dealerIndex) ? game.dealerIndex : -1;
-  game.dealerIndex = nextPlayableIndex(game, startingFrom);
-  game.turnIndex = game.dealerIndex >= 0 ? game.dealerIndex : 0;
+  // First deal belongs to the LOWEST seating-card player (last seat).
+  // Later rounds rotate the dealer one active seat to the right. The first turn
+  // of each round is the active player immediately to the dealer's right.
+  if (previousRoundNumber === 0 && Number.isInteger(game.initialDealerIndex)) {
+    game.dealerIndex = game.initialDealerIndex;
+  } else if (previousRoundNumber > 0) {
+    const nextDealer = nextPlayableIndex(game, Number.isInteger(game.dealerIndex) ? game.dealerIndex : -1);
+    if (nextDealer >= 0) game.dealerIndex = nextDealer;
+  }
+  const firstTurn = nextPlayableIndex(game, Number.isInteger(game.dealerIndex) ? game.dealerIndex : -1);
+  game.turnIndex = firstTurn >= 0 ? firstTurn : (game.dealerIndex >= 0 ? game.dealerIndex : 0);
 }
 
 function publicPlayers(players) {
@@ -556,6 +651,9 @@ function publicPlayers(players) {
     name: p.name,
     connected: p.connected !== false,
     seatIndex: p.seatIndex ?? null,
+    rankOrder: p.rankOrder ?? null,
+    seatingCard: p.seatingCard || null,
+    hasCrown: !!p.hasCrown,
   }));
 }
 
@@ -574,6 +672,11 @@ function emitRoomUpdate(code) {
     code,
     hostPlayerId: room.hostPlayerId || null,
     tableSize: normaliseTableSize(room.tableSize),
+    minPlayers: normaliseMinPlayers(room.minPlayers, room.tableSize),
+    highCardPlayerId: room.highCardPlayerId || null,
+    dealerPlayerId: room.initialDealerPlayerId || null,
+    seatChoiceRequiredPlayerId: room.seatChoiceRequiredPlayerId || null,
+    seatingDraw: seatingDrawPayload(room.pendingSeatingOrder || room.players),
     players: publicPlayers(room.players),
   });
 }
@@ -612,6 +715,18 @@ function findGamePlayer(game, playerId, socketId) {
   );
 }
 
+function scoreWindowRequiredPlayerIds(game) {
+  if (!game || game.state !== 'score_window') return [];
+  if (game.scoreWindowStage === 'declare') {
+    return game.declarationPlayerId ? [game.declarationPlayerId] : [];
+  }
+  return game.players
+    .filter((player) => player.playerId !== game.roundWinnerPlayerId)
+    .filter((player) => !game.droppedPlayerIds.has(player.playerId))
+    .filter((player) => !isEliminated(game, player.playerId))
+    .map((player) => player.playerId);
+}
+
 function buildSnapshot(game, forPlayerId) {
   const playerMeta = game.players.map((p) => ({
     id: p.id,
@@ -619,6 +734,9 @@ function buildSnapshot(game, forPlayerId) {
     name: p.name,
     connected: p.connected !== false,
     seatIndex: p.seatIndex ?? game.players.indexOf(p),
+    rankOrder: p.rankOrder ?? null,
+    seatingCard: p.seatingCard || null,
+    hasCrown: !!p.hasCrown,
     handSize: (game.handsByPlayerId[p.playerId] || []).length,
     score: game.scoresByPlayerId[p.playerId] || 0,
     roundPoints: game.roundPointsByPlayerId[p.playerId] || 0,
@@ -643,18 +761,18 @@ function buildSnapshot(game, forPlayerId) {
     state: game.state,
     roundNumber: game.roundNumber || 1,
     dealerIndex: game.dealerIndex ?? 0,
+    dealerPlayerId: game.players[game.dealerIndex]?.playerId || null,
+    highCardPlayerId: game.highCardPlayerId || null,
+    seatingDraw: game.seatingDraw || [],
     winnerPlayerId: game.winnerPlayerId || null,
     roundWinnerPlayerId: game.roundWinnerPlayerId || null,
+    declarationPlayerId: game.declarationPlayerId || null,
+    declarationSubmitted: !!game.declarationSubmitted,
+    scoreWindowStage: game.scoreWindowStage || null,
     scoreWindowEndsAt: game.scoreWindowEndsAt || null,
     scoreWindowSeconds: SCORE_WINDOW_SECONDS,
     scoreWindowSecondsRemaining: game.scoreWindowEndsAt ? Math.max(0, Math.ceil((game.scoreWindowEndsAt - Date.now()) / 1000)) : null,
-    requiredScorePlayerIds: game.state === 'score_window'
-      ? game.players
-          .filter((player) => player.playerId !== game.roundWinnerPlayerId)
-          .filter((player) => !game.droppedPlayerIds.has(player.playerId))
-          .filter((player) => !isEliminated(game, player.playerId))
-          .map((player) => player.playerId)
-      : [],
+    requiredScorePlayerIds: scoreWindowRequiredPlayerIds(game),
     submittedScorePlayerIds: [...(game.submittedScorePlayerIds || new Set())],
     roundHistory: [...(game.roundHistory || [])],
     poolAmount: safePoolAmount(game),
@@ -720,6 +838,9 @@ function buildRoundResult(code, game, forPlayerId, details = {}) {
       name: player.name,
       connected: player.connected !== false,
       seatIndex: player.seatIndex ?? game.players.indexOf(player),
+      rankOrder: player.rankOrder ?? null,
+      seatingCard: player.seatingCard || null,
+      hasCrown: !!player.hasCrown,
       score: game.scoresByPlayerId[player.playerId] || 0,
       roundPoints: game.roundPointsByPlayerId[player.playerId] || 0,
       lastRoundPoints: game.roundPointsByPlayerId[player.playerId] || 0,
@@ -767,10 +888,11 @@ function finishRound(code, details = {}) {
   }
   broadcastGameState(code);
 
-  // If only 3 or 2 players remain, keep the result screen open so every
-  // remaining player has a fair chance to review/confirm the optional split.
-  // Otherwise the normal short result pause advances to the next round.
-  if (game.state === 'round_over' && !buildSplitOffer(game)) {
+  // The split option is optional and must never trap active players on the
+  // result screen. Keep the offer visible during the normal result pause, but
+  // automatically continue the game if all eligible players do not confirm it.
+  // finalizeSplit() clears this timer when a split is accepted unanimously.
+  if (game.state === 'round_over') {
     game.nextRoundTimer = setTimeout(() => {
       const current = games[code];
       if (!current || current.state !== 'round_over' || current.splitFinalized) return;
@@ -793,6 +915,22 @@ function finalizeScoreWindow(code) {
     game.scoreWindowInterval = null;
   }
 
+  // If the player placed a card in FINISH but never pressed DECLARE SHOW,
+  // the 30-second declaration window expires as a wrong show.
+  if (game.scoreWindowStage === 'declare' && game.declarationPlayerId && !game.declarationSubmitted) {
+    addPoints(game, game.declarationPlayerId, 80);
+    game.droppedPlayerIds.add(game.declarationPlayerId);
+    const declarer = game.players.find((player) => player.playerId === game.declarationPlayerId);
+    game.pendingRoundDetails = {
+      reason: 'declaration_timeout',
+      message: `${declarer?.name || 'Player'} did not submit the declaration within 30 seconds and received 80 points.`,
+      declarerPlayerId: game.declarationPlayerId,
+      validDeclaration: false,
+      roundWinnerPlayerId: null,
+    };
+    game.scoreWindowStage = 'score';
+  }
+
   const winnerId = game.roundWinnerPlayerId;
   for (const player of game.players) {
     if (player.playerId === winnerId) continue;
@@ -806,17 +944,65 @@ function finalizeScoreWindow(code) {
   }
 
   const details = game.pendingRoundDetails || {
-    reason: 'valid_declaration',
-    message: 'The 30-second score window ended.',
+    reason: 'declaration_window_complete',
+    message: 'The 30-second declaration window ended.',
+    declarerPlayerId: game.declarationPlayerId || null,
+    validDeclaration: !!winnerId,
     roundWinnerPlayerId: winnerId,
   };
   game.pendingRoundDetails = null;
   finishRound(code, { ...details, scoreWindowFinalized: true });
 }
 
-function beginScoreWindow(code, details = {}) {
+function emitDeclarationWindowState(code) {
   const game = games[code];
-  if (!game) return;
+  if (!game || game.state !== 'score_window' || !game.scoreWindowEndsAt) return;
+  const seconds = Math.max(0, Math.ceil((game.scoreWindowEndsAt - Date.now()) / 1000));
+  io.to(code).emit('score_window_started', {
+    code,
+    roundNumber: game.roundNumber || 1,
+    stage: game.scoreWindowStage || 'declare',
+    declarerPlayerId: game.declarationPlayerId || null,
+    winnerPlayerId: game.roundWinnerPlayerId || null,
+    scoreWindowStartedAt: game.scoreWindowEndsAt - SCORE_WINDOW_SECONDS * 1000,
+    scoreWindowEndsAt: game.scoreWindowEndsAt,
+    seconds,
+    requiredPlayerIds: scoreWindowRequiredPlayerIds(game),
+    submittedPlayerIds: [...(game.submittedScorePlayerIds || new Set())],
+    message: game.scoreWindowStage === 'declare'
+      ? 'Finish confirmed. Arrange your 13 cards and press DECLARE SHOW before the 30-second timer reaches 0.'
+      : 'Declaration submitted. Other players may group their cards and commit before the timer reaches 0.',
+  });
+}
+
+function beginDeclarationWindow(code, actor, cardId) {
+  const game = games[code];
+  if (!game || !actor) return { ok: false, message: 'No active round was found.' };
+  if (game.state !== 'playing') return { ok: false, message: 'The round is not accepting a finish right now.' };
+  const currentPlayer = game.players[game.turnIndex];
+  if (!currentPlayer || actor.playerId !== currentPlayer.playerId || !isRoundActive(game, actor)) {
+    return { ok: false, message: 'You can only finish on your turn.' };
+  }
+
+  const hand = game.handsByPlayerId[actor.playerId] || [];
+  if (hand.length !== 14) return { ok: false, message: 'Draw a card before using Finish.' };
+  const discardIndex = hand.findIndex((card) => card.id === cardId);
+  if (discardIndex < 0) return { ok: false, message: 'Select a card from your hand for the finish slot.' };
+
+  const [discardedCard] = hand.splice(discardIndex, 1);
+  game.discardPile.push(discardedCard);
+  game.lastDiscardByPlayerId[actor.playerId] = discardedCard;
+  game.handsByPlayerId[actor.playerId] = hand;
+  game.state = 'score_window';
+  game.scoreWindowStage = 'declare';
+  game.declarationPlayerId = actor.playerId;
+  game.declarationSubmitted = false;
+  game.roundWinnerPlayerId = null;
+  game.pendingRoundDetails = null;
+  game.pendingScoreSubmissions = {};
+  game.submittedScorePlayerIds = new Set();
+  game.scoreWindowEndsAt = Date.now() + SCORE_WINDOW_SECONDS * 1000;
+
   if (game.nextRoundTimer) {
     clearTimeout(game.nextRoundTimer);
     game.nextRoundTimer = null;
@@ -824,44 +1010,22 @@ function beginScoreWindow(code, details = {}) {
   if (game.scoreWindowTimer) clearTimeout(game.scoreWindowTimer);
   if (game.scoreWindowInterval) clearInterval(game.scoreWindowInterval);
 
-  game.state = 'score_window';
-  game.roundWinnerPlayerId = details.roundWinnerPlayerId || details.declarerPlayerId || null;
-  game.pendingRoundDetails = { ...details };
-  game.pendingScoreSubmissions = {};
-  game.submittedScorePlayerIds = new Set(game.roundWinnerPlayerId ? [game.roundWinnerPlayerId] : []);
-  game.scoreWindowEndsAt = Date.now() + SCORE_WINDOW_SECONDS * 1000;
-
-  const requiredPlayerIds = game.players
-    .filter((player) => player.playerId !== game.roundWinnerPlayerId)
-    .filter((player) => !game.droppedPlayerIds.has(player.playerId))
-    .filter((player) => !isEliminated(game, player.playerId))
-    .map((player) => player.playerId);
-
-  io.to(code).emit('score_window_started', {
-    code,
-    roundNumber: game.roundNumber || 1,
-    winnerPlayerId: game.roundWinnerPlayerId,
-    scoreWindowStartedAt: game.scoreWindowEndsAt - SCORE_WINDOW_SECONDS * 1000,
-    scoreWindowEndsAt: game.scoreWindowEndsAt,
-    seconds: SCORE_WINDOW_SECONDS,
-    requiredPlayerIds,
-    submittedPlayerIds: [...game.submittedScorePlayerIds],
-    message: 'Winner declared. Group your cards and commit your score before the 30-second timer reaches 0.',
-  });
+  emitDeclarationWindowState(code);
   broadcastGameState(code);
 
-  // Server-authoritative 30 → 0 declaration countdown for every device.
-  const emitScoreWindowTick = () => {
+  const emitTick = () => {
     const current = games[code];
     if (!current || current.state !== 'score_window' || !current.scoreWindowEndsAt) return;
     const seconds = Math.max(0, Math.ceil((current.scoreWindowEndsAt - Date.now()) / 1000));
     io.to(code).emit('score_window_tick', {
       code,
       roundNumber: current.roundNumber || 1,
-      winnerPlayerId: current.roundWinnerPlayerId,
+      stage: current.scoreWindowStage || 'declare',
+      declarerPlayerId: current.declarationPlayerId || null,
+      winnerPlayerId: current.roundWinnerPlayerId || null,
       scoreWindowEndsAt: current.scoreWindowEndsAt,
       seconds,
-      requiredPlayerIds,
+      requiredPlayerIds: scoreWindowRequiredPlayerIds(current),
       submittedPlayerIds: [...(current.submittedScorePlayerIds || new Set())],
     });
     if (seconds <= 0 && current.scoreWindowInterval) {
@@ -869,9 +1033,82 @@ function beginScoreWindow(code, details = {}) {
       current.scoreWindowInterval = null;
     }
   };
-  emitScoreWindowTick();
-  game.scoreWindowInterval = setInterval(emitScoreWindowTick, 1000);
+  emitTick();
+  game.scoreWindowInterval = setInterval(emitTick, 1000);
   game.scoreWindowTimer = setTimeout(() => finalizeScoreWindow(code), SCORE_WINDOW_SECONDS * 1000);
+
+  return {
+    ok: true,
+    scoreWindow: true,
+    stage: 'declare',
+    declarerPlayerId: actor.playerId,
+    scoreWindowEndsAt: game.scoreWindowEndsAt,
+    discardedCard,
+  };
+}
+
+function submitDeclarationShow(code, actor) {
+  const game = games[code];
+  if (!game || game.state !== 'score_window' || game.scoreWindowStage !== 'declare') {
+    return { ok: false, message: 'The 30-second declaration window is not open.' };
+  }
+  if (!game.scoreWindowEndsAt || Date.now() >= game.scoreWindowEndsAt) {
+    return { ok: false, message: 'The 30-second declaration window has expired.' };
+  }
+  if (!actor || actor.playerId !== game.declarationPlayerId) {
+    return { ok: false, message: 'Only the player who used Finish can submit this declaration.' };
+  }
+  if (game.declarationSubmitted) return { ok: false, message: 'Declaration has already been submitted.' };
+
+  const hand = game.handsByPlayerId[actor.playerId] || [];
+  if (hand.length !== 13) return { ok: false, message: 'A declaration must contain exactly 13 cards.' };
+
+  const verdict = validateDeclaration(hand, game.wildJoker);
+  game.declarationSubmitted = true;
+  game.submittedScorePlayerIds.add(actor.playerId);
+  game.scoreWindowStage = 'score';
+
+  io.to(code).emit('player_declared', {
+    code,
+    playerId: actor.playerId,
+    valid: verdict.valid,
+    reason: verdict.reason,
+  });
+
+  if (verdict.valid) {
+    game.roundWinnerPlayerId = actor.playerId;
+    game.pendingRoundDetails = {
+      reason: 'valid_declaration',
+      message: `${actor.name} made a valid declaration. Scores finalize when the 30-second timer reaches 0.`,
+      declarerPlayerId: actor.playerId,
+      validDeclaration: true,
+      roundWinnerPlayerId: actor.playerId,
+    };
+  } else {
+    addPoints(game, actor.playerId, 80);
+    game.droppedPlayerIds.add(actor.playerId);
+    game.roundWinnerPlayerId = null;
+    game.pendingRoundDetails = {
+      reason: 'wrong_declaration',
+      message: `${actor.name} made a wrong declaration and received 80 points. Scores finalize when the timer reaches 0.`,
+      declarerPlayerId: actor.playerId,
+      validDeclaration: false,
+      roundWinnerPlayerId: null,
+    };
+    io.to(code).emit('player_dropped', { code, playerId: actor.playerId, penalty: 80, reason: 'wrong_declaration' });
+  }
+
+  emitDeclarationWindowState(code);
+  broadcastGameState(code);
+  return {
+    ok: true,
+    valid: verdict.valid,
+    reason: verdict.reason,
+    scoreWindow: true,
+    stage: 'score',
+    scoreWindowEndsAt: game.scoreWindowEndsAt,
+    winnerPlayerId: game.roundWinnerPlayerId || null,
+  };
 }
 
 function finalizeSplit(code) {
@@ -1017,6 +1254,105 @@ function removePlayerAfterGrace(code, playerId) {
   emitRoomUpdate(code);
 }
 
+
+function clearSeatingChoiceTimer(room) {
+  if (room?.seatingChoiceTimer) clearTimeout(room.seatingChoiceTimer);
+  if (room) room.seatingChoiceTimer = null;
+}
+
+function cancelPendingSeating(code, message = 'Seating draw cancelled.') {
+  const room = rooms[code];
+  if (!room) return;
+  clearSeatingChoiceTimer(room);
+  room.pendingSeatingOrder = null;
+  room.seatChoiceRequiredPlayerId = null;
+  room.highCardPlayerId = null;
+  room.initialDealerPlayerId = null;
+  for (const p of room.players) {
+    p.rankOrder = null;
+    p.seatIndex = null;
+    p.seatingCard = null;
+    p.hasCrown = false;
+  }
+  emitRoomUpdate(code);
+  io.to(code).emit('game_error', { message });
+}
+
+function scheduleGameStart(code) {
+  const room = rooms[code];
+  if (!room || games[code] || room.gameStartScheduled) return false;
+  const connectedPlayers = room.players.filter((p) => p.connected !== false);
+  const requiredPlayers = normaliseMinPlayers(room.minPlayers, room.tableSize);
+  if (connectedPlayers.length < requiredPlayers) {
+    cancelPendingSeating(code, `Need at least ${requiredPlayers} connected real players to start.`);
+    return false;
+  }
+  if (connectedPlayers.some((p) => !Number.isInteger(p.seatIndex))) return false;
+
+  clearSeatingChoiceTimer(room);
+  room.gameStartScheduled = true;
+  const seatingDraw = seatingDrawPayload(connectedPlayers);
+  io.to(code).emit('game_starting', {
+    code,
+    countdown: START_COUNTDOWN_SECONDS,
+    seatingDraw,
+    highCardPlayerId: room.highCardPlayerId,
+    dealerPlayerId: room.initialDealerPlayerId,
+  });
+
+  setTimeout(() => {
+    const currentRoom = rooms[code];
+    if (!currentRoom) return;
+    currentRoom.gameStartScheduled = false;
+    if (games[code]) return;
+
+    const players = currentRoom.players
+      .filter((p) => p.connected !== false)
+      .sort((a, b) => (a.seatIndex ?? 99) - (b.seatIndex ?? 99))
+      .map((p) => ({ ...p }));
+    if (players.length < normaliseMinPlayers(currentRoom.minPlayers, currentRoom.tableSize)) {
+      cancelPendingSeating(code, 'Too many players disconnected before the game started.');
+      return;
+    }
+
+    const initialDealerIndex = players.findIndex((p) => p.playerId === currentRoom.initialDealerPlayerId);
+    const game = {
+      players,
+      scoresByPlayerId: Object.fromEntries(players.map((player) => [player.playerId, 0])),
+      roundPointsByPlayerId: {},
+      lastRoundPointsByPlayerId: Object.fromEntries(players.map((player) => [player.playerId, 0])),
+      droppedPlayerIds: new Set(),
+      lastDiscardByPlayerId: {},
+      roundNumber: 0,
+      dealerIndex: initialDealerIndex >= 0 ? initialDealerIndex : Math.max(0, players.length - 1),
+      initialDealerIndex: initialDealerIndex >= 0 ? initialDealerIndex : Math.max(0, players.length - 1),
+      highCardPlayerId: currentRoom.highCardPlayerId || players.find((p) => p.hasCrown)?.playerId || null,
+      seatingDraw: seatingDrawPayload(players),
+      winnerPlayerId: null,
+      actionSequence: 0,
+      lastAction: null,
+      roundHistory: [],
+      roundWinnerPlayerId: null,
+      declarationPlayerId: null,
+      declarationSubmitted: false,
+      scoreWindowStage: null,
+      scoreWindowEndsAt: null,
+      scoreWindowTimer: null,
+      scoreWindowInterval: null,
+      pendingScoreSubmissions: {},
+      submittedScorePlayerIds: new Set(),
+      splitConfirmedPlayerIds: new Set(),
+      splitFinalized: false,
+      splitResult: null,
+      poolAmount: Math.max(0, Number(currentRoom.entryFee) || 0) * players.length,
+    };
+    games[code] = game;
+    dealRound(game);
+    broadcastGameState(code);
+  }, START_COUNTDOWN_SECONDS * 1000);
+  return true;
+}
+
 app.get('/', (req, res) => {
   res.json({ ok: true, service: 'Star Rummy multiplayer', rooms: Object.keys(rooms).length });
 });
@@ -1030,6 +1366,7 @@ io.on('connection', (socket) => {
     const playerName = String(payload.playerName || 'Host').trim().slice(0, 40) || 'Host';
     const entryFee = Math.max(0, Number(payload.entryFee) || 0);
     const tableSize = normaliseTableSize(payload.tableSize);
+    const minPlayers = normaliseMinPlayers(payload.minPlayers, tableSize);
 
     if (!code || !playerId) {
       const response = { ok: false, message: 'Room code and player identity are required.' };
@@ -1056,10 +1393,10 @@ io.on('connection', (socket) => {
       bindPlayerSocket(code, hostPlayer, socket);
       existing.host = socket.id;
       if (entryFee > 0) existing.entryFee = entryFee;
-      if (!games[code]) existing.tableSize = tableSize;
+      if (!games[code]) { existing.tableSize = tableSize; existing.minPlayers = minPlayers; }
       socket.emit('room_registered', { code, resumed: true });
       emitRoomUpdate(code);
-      const response = { ok: true, code, resumed: true, hostPlayerId: existing.hostPlayerId || null, entryFee: existing.entryFee || 0, tableSize: existing.tableSize, players: publicPlayers(existing.players) };
+      const response = { ok: true, code, resumed: true, hostPlayerId: existing.hostPlayerId || null, entryFee: existing.entryFee || 0, tableSize: existing.tableSize, minPlayers: normaliseMinPlayers(existing.minPlayers, existing.tableSize), players: publicPlayers(existing.players) };
       ack?.(response);
       return;
     }
@@ -1069,12 +1406,13 @@ io.on('connection', (socket) => {
       hostPlayerId: playerId,
       entryFee,
       tableSize,
+      minPlayers,
       players: [{ id: socket.id, playerId, name: playerName, connected: true }],
     };
     socket.join(code);
     socket.emit('room_registered', { code, resumed: false });
     emitRoomUpdate(code);
-    ack?.({ ok: true, code, resumed: false, hostPlayerId: rooms[code].hostPlayerId || null, entryFee: rooms[code].entryFee || 0, tableSize, players: publicPlayers(rooms[code].players) });
+    ack?.({ ok: true, code, resumed: false, hostPlayerId: rooms[code].hostPlayerId || null, entryFee: rooms[code].entryFee || 0, tableSize, minPlayers, players: publicPlayers(rooms[code].players) });
   });
 
   socket.on('validate_room', (payload = {}, ack) => {
@@ -1082,7 +1420,7 @@ io.on('connection', (socket) => {
     const room = rooms[code];
     const roomTableSize = normaliseTableSize(room?.tableSize);
     const valid = !!room && !games[code] && room.players.length < roomTableSize;
-    const response = { code, valid, entryFee: room?.entryFee || 0, tableSize: roomTableSize, playerCount: room?.players?.length || 0 };
+    const response = { code, valid, entryFee: room?.entryFee || 0, tableSize: roomTableSize, minPlayers: normaliseMinPlayers(room?.minPlayers, roomTableSize), playerCount: room?.players?.length || 0 };
     socket.emit('room_validated', response);
     ack?.({ ok: true, ...response });
   });
@@ -1137,7 +1475,7 @@ io.on('connection', (socket) => {
       sendLatestRoundResult(code, gamePlayer);
     }
 
-    ack?.({ ok: true, code, hostPlayerId: room.hostPlayerId || null, entryFee: room.entryFee || 0, tableSize: normaliseTableSize(room.tableSize), players: publicPlayers(room.players), resumed: !!games[code] });
+    ack?.({ ok: true, code, hostPlayerId: room.hostPlayerId || null, entryFee: room.entryFee || 0, tableSize: normaliseTableSize(room.tableSize), minPlayers: normaliseMinPlayers(room.minPlayers, room.tableSize), players: publicPlayers(room.players), resumed: !!games[code] });
   });
 
   socket.on('leave_room', (payload = {}, ack) => {
@@ -1237,9 +1575,10 @@ io.on('connection', (socket) => {
     }
 
     const connectedPlayers = room.players.filter((p) => p.connected !== false);
-    const requiredPlayers = normaliseTableSize(room.tableSize);
+    const maxSeats = normaliseTableSize(room.tableSize);
+    const requiredPlayers = normaliseMinPlayers(room.minPlayers, maxSeats);
     if (connectedPlayers.length < requiredPlayers) {
-      const response = { ok: false, message: requiredPlayers === 6 ? 'This is a 6-player table. All 6 players must be seated before the host starts.' : 'Both players must be connected before the host starts.' };
+      const response = { ok: false, message: `Need at least ${requiredPlayers} connected real players to start. (${connectedPlayers.length}/${maxSeats} seated)` };
       socket.emit('game_error', response);
       ack?.(response);
       return;
@@ -1251,51 +1590,116 @@ io.on('connection', (socket) => {
       return;
     }
 
-    io.to(code).emit('game_starting', { code, countdown: START_COUNTDOWN_SECONDS });
-    ack?.({ ok: true, code, countdown: START_COUNTDOWN_SECONDS });
+    if (room.gameStartScheduled) {
+      ack?.({ ok: true, code, alreadyStarting: true, countdown: START_COUNTDOWN_SECONDS });
+      return;
+    }
 
-    setTimeout(() => {
-      if (games[code] || !rooms[code]) return;
-      const currentRoom = rooms[code];
-      const players = currentRoom.players
-        .filter((p) => p.connected !== false)
-        .map((p, seatIndex) => ({ ...p, seatIndex }));
-      if (players.length < normaliseTableSize(currentRoom.tableSize)) {
-        io.to(code).emit('game_error', { message: 'A player disconnected before all required seats were ready.' });
+    if (room.seatChoiceRequiredPlayerId && room.pendingSeatingOrder) {
+      ack?.({
+        ok: true,
+        code,
+        awaitingSeatChoice: true,
+        seatingDraw: seatingDrawPayload(room.pendingSeatingOrder),
+        highCardPlayerId: room.highCardPlayerId,
+        dealerPlayerId: room.initialDealerPlayerId,
+        seatChoiceRequiredPlayerId: room.seatChoiceRequiredPlayerId,
+        availableSeatCount: maxSeats,
+      });
+      return;
+    }
+
+    // Session seating: every REAL player draws. Highest gets the crown and the
+    // privilege to choose a physical seat. Only after that choice do the next
+    // highest players take successive seats to the RIGHT. Lowest is therefore
+    // immediately to the highest player's LEFT in the occupied-seat ring and
+    // becomes the first dealer; bots are never injected into multiplayer.
+    const rankedPlayers = createSeatingDraw(connectedPlayers);
+    room.pendingSeatingOrder = rankedPlayers;
+    room.players = rankedPlayers;
+    room.highCardPlayerId = rankedPlayers.find((p) => p.rankOrder === 0)?.playerId || null;
+    room.initialDealerPlayerId = rankedPlayers.find((p) => p.rankOrder === rankedPlayers.length - 1)?.playerId || null;
+    room.seatChoiceRequiredPlayerId = room.highCardPlayerId;
+    clearSeatingChoiceTimer(room);
+    emitRoomUpdate(code);
+
+    const drawPayload = {
+      code,
+      seatingDraw: seatingDrawPayload(rankedPlayers),
+      highCardPlayerId: room.highCardPlayerId,
+      dealerPlayerId: room.initialDealerPlayerId,
+      seatChoiceRequiredPlayerId: room.seatChoiceRequiredPlayerId,
+      availableSeatCount: maxSeats,
+      chooseSeatSeconds: 12,
+    };
+    io.to(code).emit('seating_drawn', drawPayload);
+    ack?.({ ok: true, awaitingSeatChoice: true, ...drawPayload });
+
+    // Do not freeze the room if the crown player walks away from the choice.
+    // Seat 1 is a deterministic fallback after 12 seconds.
+    room.seatingChoiceTimer = setTimeout(() => {
+      const current = rooms[code];
+      if (!current || games[code] || !current.seatChoiceRequiredPlayerId) return;
+      const required = normaliseMinPlayers(current.minPlayers, current.tableSize);
+      if (current.players.filter((p) => p.connected !== false).length < required) {
+        cancelPendingSeating(code, `Need at least ${required} connected real players to continue.`);
         return;
       }
-
-      const game = {
-        players,
-        scoresByPlayerId: Object.fromEntries(players.map((player) => [player.playerId, 0])),
-        roundPointsByPlayerId: {},
-        lastRoundPointsByPlayerId: Object.fromEntries(players.map((player) => [player.playerId, 0])),
-        droppedPlayerIds: new Set(),
-        lastDiscardByPlayerId: {},
-        roundNumber: 0,
-        dealerIndex: -1,
-        winnerPlayerId: null,
-        actionSequence: 0,
-        lastAction: null,
-        roundHistory: [],
-        roundWinnerPlayerId: null,
-        scoreWindowEndsAt: null,
-        scoreWindowTimer: null,
-        scoreWindowInterval: null,
-        pendingScoreSubmissions: {},
-        submittedScorePlayerIds: new Set(),
-        splitConfirmedPlayerIds: new Set(),
-        splitFinalized: false,
-        splitResult: null,
-        poolAmount: Math.max(0, Number(currentRoom.entryFee) || 0) * players.length,
-      };
-      games[code] = game;
-      dealRound(game);
-
-      broadcastGameState(code);
-    }, START_COUNTDOWN_SECONDS * 1000);
+      finalizeSeatingChoice(current, 0);
+      emitRoomUpdate(code);
+      scheduleGameStart(code);
+    }, 12000);
   });
 
+  socket.on('choose_seat', (payload = {}, ack) => {
+    const code = normaliseCode(payload.code);
+    const playerId = String(payload.playerId || '').trim();
+    const room = rooms[code];
+    if (!room || games[code]) {
+      ack?.({ ok: false, message: 'Room is no longer waiting for seating.' });
+      return;
+    }
+    if (!room.seatChoiceRequiredPlayerId || !room.pendingSeatingOrder) {
+      ack?.({ ok: false, message: 'No seating choice is pending.' });
+      return;
+    }
+    if (playerId !== room.seatChoiceRequiredPlayerId) {
+      ack?.({ ok: false, message: 'Only the highest-card crown player can choose the seat.' });
+      return;
+    }
+    const chooser = room.players.find((p) => p.playerId === playerId);
+    if (!chooser || chooser.connected === false) {
+      ack?.({ ok: false, message: 'Crown player is not connected.' });
+      return;
+    }
+    const maxSeats = normaliseTableSize(room.tableSize);
+    const requested = Number(payload.seatIndex);
+    if (!Number.isInteger(requested) || requested < 0 || requested >= maxSeats) {
+      ack?.({ ok: false, message: `Choose a seat from 1 to ${maxSeats}.` });
+      return;
+    }
+    const required = normaliseMinPlayers(room.minPlayers, room.tableSize);
+    if (room.players.filter((p) => p.connected !== false).length < required) {
+      cancelPendingSeating(code, `Need at least ${required} connected real players to continue.`);
+      ack?.({ ok: false, message: `Need at least ${required} connected real players to continue.` });
+      return;
+    }
+
+    clearSeatingChoiceTimer(room);
+    const seatedPlayers = finalizeSeatingChoice(room, requested);
+    emitRoomUpdate(code);
+    const response = {
+      ok: true,
+      code,
+      chosenSeatIndex: requested,
+      countdown: START_COUNTDOWN_SECONDS,
+      seatingDraw: seatingDrawPayload(seatedPlayers),
+      highCardPlayerId: room.highCardPlayerId,
+      dealerPlayerId: room.initialDealerPlayerId,
+    };
+    ack?.(response);
+    scheduleGameStart(code);
+  });
   socket.on('draw_card', (payload = {}, ack) => {
     const code = normaliseCode(payload.code);
     const playerId = String(payload.playerId || '').trim();
@@ -1509,106 +1913,38 @@ io.on('connection', (socket) => {
     ack?.({ ok: true, penalty, roundOver: false, nextTurnPlayerId: game.players[game.turnIndex]?.playerId || null });
   });
 
-  socket.on('declare', (payload = {}, ack) => {
+  const handleBeginDeclaration = (payload = {}, ack) => {
     const code = normaliseCode(payload.code);
     const playerId = String(payload.playerId || '').trim();
     const cardId = String(payload.cardId || '').trim();
     const game = games[code];
-
-    if (!game || game.state !== 'playing') {
-      const response = { ok: false, message: 'No active round was found.' };
-      socket.emit('game_error', response);
-      ack?.(response);
-      return;
-    }
-
     const actor = findGamePlayer(game, playerId, socket.id);
-    const currentPlayer = game.players[game.turnIndex];
-    if (!actor || !currentPlayer || actor.playerId !== currentPlayer.playerId || !isRoundActive(game, actor)) {
-      const response = { ok: false, message: 'You can only declare on your turn.' };
-      socket.emit('game_error', response);
-      ack?.(response);
-      return;
-    }
+    const response = beginDeclarationWindow(code, actor, cardId);
+    if (!response.ok) socket.emit('game_error', response);
+    ack?.(response);
+  };
 
-    const hand = game.handsByPlayerId[actor.playerId] || [];
-    if (hand.length !== 14) {
-      const response = { ok: false, message: 'Draw a card before declaring.' };
-      socket.emit('game_error', response);
-      ack?.(response);
-      return;
-    }
+  // New clients use begin_declare. Keep declare as a compatibility alias so an
+  // older APK still gets the safe 30-second review window instead of instant validation.
+  socket.on('begin_declare', handleBeginDeclaration);
+  socket.on('declare', handleBeginDeclaration);
 
-    const discardIndex = hand.findIndex((card) => card.id === cardId);
-    if (discardIndex < 0) {
-      const response = { ok: false, message: 'Select a card from your hand for the finish slot.' };
-      socket.emit('game_error', response);
-      ack?.(response);
-      return;
-    }
-
-    const [discardedCard] = hand.splice(discardIndex, 1);
-    game.discardPile.push(discardedCard);
-    game.lastDiscardByPlayerId[actor.playerId] = discardedCard;
-    game.handsByPlayerId[actor.playerId] = hand;
-
-    const verdict = validateDeclaration(hand, game.wildJoker);
-
-    io.to(code).emit('player_declared', {
-      code,
-      playerId: actor.playerId,
-      valid: verdict.valid,
-      reason: verdict.reason,
-    });
-
-    if (!verdict.valid) {
-      addPoints(game, actor.playerId, 80);
-      game.droppedPlayerIds.add(actor.playerId);
-      io.to(code).emit('player_dropped', { code, playerId: actor.playerId, penalty: 80, reason: 'wrong_declaration' });
-
-      const stillPlaying = activeRoundPlayers(game);
-      if (stillPlaying.length <= 1) {
-        finishRound(code, {
-          reason: 'wrong_declaration',
-          message: `${actor.name} made a wrong declaration and received 80 points.`,
-          declarerPlayerId: actor.playerId,
-          validDeclaration: false,
-          roundWinnerPlayerId: stillPlaying[0]?.playerId || null,
-        });
-        ack?.({ ok: true, valid: false, roundOver: true, reason: verdict.reason });
-        return;
-      }
-
-      const nextTurnIndex = nextPlayableIndex(game, game.turnIndex);
-      if (nextTurnIndex >= 0) game.turnIndex = nextTurnIndex;
-      broadcastGameState(code);
-      ack?.({ ok: true, valid: false, roundOver: false, reason: verdict.reason });
-      return;
-    }
-
-    beginScoreWindow(code, {
-      reason: 'valid_declaration',
-      message: `${actor.name} made a valid declaration. 30-second score submission window started.`,
-      declarerPlayerId: actor.playerId,
-      validDeclaration: true,
-      roundWinnerPlayerId: actor.playerId,
-    });
-    ack?.({
-      ok: true,
-      valid: true,
-      roundOver: false,
-      scoreWindow: true,
-      scoreWindowEndsAt: game.scoreWindowEndsAt,
-      reason: verdict.reason,
-    });
+  socket.on('confirm_declaration', (payload = {}, ack) => {
+    const code = normaliseCode(payload.code);
+    const playerId = String(payload.playerId || '').trim();
+    const game = games[code];
+    const actor = findGamePlayer(game, playerId, socket.id);
+    const response = submitDeclarationShow(code, actor);
+    if (!response.ok) socket.emit('game_error', response);
+    ack?.(response);
   });
 
   socket.on('submit_round_score', (payload = {}, ack) => {
     const code = normaliseCode(payload.code);
     const playerId = String(payload.playerId || '').trim();
     const game = games[code];
-    if (!game || game.state !== 'score_window') {
-      ack?.({ ok: false, message: 'The score window is not open.' });
+    if (!game || game.state !== 'score_window' || game.scoreWindowStage !== 'score') {
+      ack?.({ ok: false, message: game?.scoreWindowStage === 'declare' ? 'Wait for the finishing player to press DECLARE SHOW.' : 'The score window is not open.' });
       return;
     }
     if (!game.scoreWindowEndsAt || Date.now() >= game.scoreWindowEndsAt) {
@@ -1685,6 +2021,15 @@ io.on('connection', (socket) => {
     }
     if (game.state === 'finished') {
       ack?.({ ok: false, message: 'The game is already finished.', winnerPlayerId: game.winnerPlayerId });
+      return;
+    }
+    // A double tap or a slow acknowledgement can arrive after the server has
+    // already dealt the next round. Treat that as success and re-send the
+    // authoritative state instead of leaving the client stuck on the result UI.
+    if (game.state === 'playing') {
+      const actor = findGamePlayer(game, playerId, socket.id);
+      if (actor) sendGameStateToPlayer(code, actor);
+      ack?.({ ok: true, alreadyStarted: true, code, roundNumber: game.roundNumber });
       return;
     }
     if (game.state !== 'round_over') {

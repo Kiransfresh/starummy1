@@ -1,5 +1,14 @@
-# Railway backend - final 30-second declaration flow
+# Star Rummy 101 Railway backend - Real Player Seating 2 to 6
 
-Deploy this backend before testing Join/Private Room.
+Deploy this backend before building/testing the matching APK.
 
-The server owns the declaration deadline and emits `score_window_tick` once per second from 30 to 0. Scores are not finalized and `round_result` is not emitted until the score window expires. The result pause is 8 seconds. Existing 6-player seating, right-side turn order, 101 Joker rules, eliminations and split logic remain included.
+Key room rules:
+- Capacity: 6 real players.
+- Minimum to start: configurable 2-6; no multiplayer bots.
+- At session start every connected player draws a seating card, Ace high.
+- Highest card gets the crown and chooses a physical seat.
+- Next-highest seats to the right, continuing clockwise.
+- Lowest is the first dealer; first turn is to the dealer's right.
+- 12-second fallback chooses Seat 1 if the crown player does not answer.
+
+The backend `server.js` is the authoritative source for seating, dealer, turn, 101 score, declaration, split, and room synchronization.
