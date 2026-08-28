@@ -251,6 +251,15 @@ const io = new Server(httpServer, {
 const MAX_PLAYERS = 6;
 const RECONNECT_GRACE_MS = 45_000;
 const START_COUNTDOWN_SECONDS = 3;
+const START_TOSS_FLIGHT_MS = 320;
+const START_TOSS_GAP_MS = 110;
+const START_FLIP_MS = 400;
+const START_HIGHEST_HOLD_MS = 1050;
+const START_CROWN_MS = 620;
+const START_DEALER_MS = 520;
+const START_CLEAR_MS = 380;
+const INITIAL_DEAL_FLIGHT_MS = 290;
+const INITIAL_DEAL_GAP_MS = 95;
 const SCORE_WINDOW_SECONDS = 30;
 const ROUND_RESULT_SECONDS = 8;
 const SPLIT_COUNTS = new Set([2, 3]);
@@ -1278,6 +1287,98 @@ function cancelPendingSeating(code, message = 'Seating draw cancelled.') {
   io.to(code).emit('game_error', { message });
 }
 
+function clearStartSequenceTimers(room) {
+  for (const timer of room?.startSequenceTimers || []) clearTimeout(timer);
+  if (room) room.startSequenceTimers = [];
+}
+
+function storeStartSequence(room, phase, payload = {}) {
+  if (!room) return;
+  room.startSequence = {
+    phase,
+    updatedAt: Date.now(),
+    ...payload,
+  };
+}
+
+function emitStartSequenceEvent(code, eventName, phase, payload = {}) {
+  const room = rooms[code];
+  if (!room) return;
+  const body = { code, ...payload };
+  storeStartSequence(room, phase, body);
+  io.to(code).emit(eventName, body);
+}
+
+function makeInitialGame(currentRoom, players) {
+  const initialDealerIndex = players.findIndex((p) => p.playerId === currentRoom.initialDealerPlayerId);
+  return {
+    players,
+    scoresByPlayerId: Object.fromEntries(players.map((player) => [player.playerId, 0])),
+    roundPointsByPlayerId: {},
+    lastRoundPointsByPlayerId: Object.fromEntries(players.map((player) => [player.playerId, 0])),
+    droppedPlayerIds: new Set(),
+    lastDiscardByPlayerId: {},
+    roundNumber: 0,
+    dealerIndex: initialDealerIndex >= 0 ? initialDealerIndex : Math.max(0, players.length - 1),
+    initialDealerIndex: initialDealerIndex >= 0 ? initialDealerIndex : Math.max(0, players.length - 1),
+    highCardPlayerId: currentRoom.highCardPlayerId || players.find((p) => p.hasCrown)?.playerId || null,
+    seatingDraw: seatingDrawPayload(players),
+    winnerPlayerId: null,
+    actionSequence: 0,
+    lastAction: null,
+    roundHistory: [],
+    roundWinnerPlayerId: null,
+    declarationPlayerId: null,
+    declarationSubmitted: false,
+    scoreWindowStage: null,
+    scoreWindowEndsAt: null,
+    scoreWindowTimer: null,
+    scoreWindowInterval: null,
+    pendingScoreSubmissions: {},
+    submittedScorePlayerIds: new Set(),
+    splitConfirmedPlayerIds: new Set(),
+    splitFinalized: false,
+    splitResult: null,
+    poolAmount: Math.max(0, Number(currentRoom.entryFee) || 0) * players.length,
+  };
+}
+
+function initialDealOrder(game) {
+  const active = game.players.filter((player) => !isEliminated(game, player.playerId));
+  if (!active.length) return [];
+  const dealerPlayerId = game.players[game.dealerIndex]?.playerId;
+  const dealerActiveIndex = active.findIndex((player) => player.playerId === dealerPlayerId);
+  const start = dealerActiveIndex >= 0 ? dealerActiveIndex : active.length - 1;
+  const ordered = [];
+  for (let offset = 1; offset <= active.length; offset += 1) {
+    ordered.push(active[(start + offset) % active.length]);
+  }
+  return ordered;
+}
+
+function buildInitialDealPayload(code, game, playerId, common = {}) {
+  const order = initialDealOrder(game);
+  return {
+    code,
+    phase: 'initial_deal',
+    players: publicPlayers(game.players),
+    seatingDraw: game.seatingDraw || [],
+    highCardPlayerId: game.highCardPlayerId || null,
+    dealerPlayerId: game.players[game.dealerIndex]?.playerId || null,
+    dealOrderPlayerIds: order.map((player) => player.playerId),
+    cardsPerPlayer: 13,
+    cardFlightMs: INITIAL_DEAL_FLIGHT_MS,
+    cardGapMs: INITIAL_DEAL_GAP_MS,
+    hand: [...(game.handsByPlayerId[playerId] || [])],
+    ...common,
+  };
+}
+
+function sendInitialDealToPlayer(code, game, player, common = {}) {
+  if (!player?.id || player.connected === false) return;
+  io.to(player.id).emit('initialDealStarted', buildInitialDealPayload(code, game, player.playerId, common));
+}
+
 function scheduleGameStart(code) {
   const room = rooms[code];
   if (!room || games[code] || room.gameStartScheduled) return false;
@@ -1290,66 +1391,173 @@ function scheduleGameStart(code) {
   if (connectedPlayers.some((p) => !Number.isInteger(p.seatIndex))) return false;
 
   clearSeatingChoiceTimer(room);
+  clearStartSequenceTimers(room);
   room.gameStartScheduled = true;
+  room.startSequenceTimers = [];
+
   const seatingDraw = seatingDrawPayload(connectedPlayers);
-  io.to(code).emit('game_starting', {
-    code,
-    countdown: START_COUNTDOWN_SECONDS,
+  const publicStart = {
     seatingDraw,
+    players: publicPlayers(connectedPlayers),
     highCardPlayerId: room.highCardPlayerId,
     dealerPlayerId: room.initialDealerPlayerId,
+  };
+  const countdownStartedAt = Date.now();
+  const countdownEndsAt = countdownStartedAt + START_COUNTDOWN_SECONDS * 1000;
+  const countdownPayload = {
+    ...publicStart,
+    countdown: START_COUNTDOWN_SECONDS,
+    countdownStartedAt,
+    countdownEndsAt,
+  };
+  storeStartSequence(room, 'countdown', { code, ...countdownPayload });
+  io.to(code).emit('gameStarting', { code, ...countdownPayload });
+  // Legacy event retained so older APKs still show their existing countdown.
+  io.to(code).emit('game_starting', { code, ...countdownPayload });
+
+  const addTimer = (delayMs, fn) => {
+    const timer = setTimeout(() => {
+      const currentRoom = rooms[code];
+      if (!currentRoom || !currentRoom.gameStartScheduled) return;
+      fn(currentRoom);
+    }, delayMs);
+    room.startSequenceTimers.push(timer);
+  };
+
+  const playerCount = connectedPlayers.length;
+  const tossFlightWindow = Math.max(START_TOSS_FLIGHT_MS, (playerCount - 1) * START_TOSS_GAP_MS + START_TOSS_FLIGHT_MS);
+  const tossAt = START_COUNTDOWN_SECONDS * 1000;
+  const revealAt = tossAt + tossFlightWindow + 260;
+  const highestAt = revealAt + START_FLIP_MS + 220;
+  const seatAt = highestAt + START_HIGHEST_HOLD_MS + START_CROWN_MS;
+  const dealerAt = seatAt + 430;
+  const clearAt = dealerAt + START_DEALER_MS + 720;
+  const dealAt = clearAt + START_CLEAR_MS + 120;
+
+  addTimer(tossAt, (currentRoom) => {
+    emitStartSequenceEvent(code, 'tossCardsGenerated', 'toss_flying', {
+      ...publicStart,
+      cardFlightMs: START_TOSS_FLIGHT_MS,
+      cardGapMs: START_TOSS_GAP_MS,
+      startedAt: Date.now(),
+    });
   });
 
-  setTimeout(() => {
-    const currentRoom = rooms[code];
-    if (!currentRoom) return;
-    currentRoom.gameStartScheduled = false;
-    if (games[code]) return;
+  addTimer(revealAt, () => {
+    emitStartSequenceEvent(code, 'tossCardsRevealed', 'revealed', {
+      ...publicStart,
+      flipMs: START_FLIP_MS,
+      startedAt: Date.now(),
+    });
+  });
 
+  addTimer(highestAt, () => {
+    const high = seatingDraw.find((pick) => pick.playerId === room.highCardPlayerId) || seatingDraw[0] || null;
+    emitStartSequenceEvent(code, 'highestCardPlayer', 'highest', {
+      ...publicStart,
+      playerId: room.highCardPlayerId,
+      card: high?.card || null,
+      highlightMs: START_HIGHEST_HOLD_MS,
+      crownTravelMs: START_CROWN_MS,
+      startedAt: Date.now(),
+    });
+  });
+
+  addTimer(seatAt, (currentRoom) => {
+    emitStartSequenceEvent(code, 'seatOrder', 'seat_order', {
+      ...publicStart,
+      players: publicPlayers(currentRoom.players.filter((p) => p.connected !== false)),
+      startedAt: Date.now(),
+    });
+  });
+
+  addTimer(dealerAt, () => {
+    const low = seatingDraw.find((pick) => pick.playerId === room.initialDealerPlayerId) || seatingDraw[seatingDraw.length - 1] || null;
+    emitStartSequenceEvent(code, 'dealerPlayerId', 'dealer', {
+      ...publicStart,
+      playerId: room.initialDealerPlayerId,
+      card: low?.card || null,
+      dealerTravelMs: START_DEALER_MS,
+      startedAt: Date.now(),
+    });
+  });
+
+  addTimer(clearAt, () => {
+    emitStartSequenceEvent(code, 'selectionCardsCleared', 'cleanup', {
+      ...publicStart,
+      clearMs: START_CLEAR_MS,
+      startedAt: Date.now(),
+    });
+  });
+
+  addTimer(dealAt, (currentRoom) => {
+    if (games[code]) return;
     const players = currentRoom.players
       .filter((p) => p.connected !== false)
       .sort((a, b) => (a.seatIndex ?? 99) - (b.seatIndex ?? 99))
       .map((p) => ({ ...p }));
     if (players.length < normaliseMinPlayers(currentRoom.minPlayers, currentRoom.tableSize)) {
+      currentRoom.gameStartScheduled = false;
       cancelPendingSeating(code, 'Too many players disconnected before the game started.');
       return;
     }
 
-    const initialDealerIndex = players.findIndex((p) => p.playerId === currentRoom.initialDealerPlayerId);
-    const game = {
-      players,
-      scoresByPlayerId: Object.fromEntries(players.map((player) => [player.playerId, 0])),
-      roundPointsByPlayerId: {},
-      lastRoundPointsByPlayerId: Object.fromEntries(players.map((player) => [player.playerId, 0])),
-      droppedPlayerIds: new Set(),
-      lastDiscardByPlayerId: {},
-      roundNumber: 0,
-      dealerIndex: initialDealerIndex >= 0 ? initialDealerIndex : Math.max(0, players.length - 1),
-      initialDealerIndex: initialDealerIndex >= 0 ? initialDealerIndex : Math.max(0, players.length - 1),
-      highCardPlayerId: currentRoom.highCardPlayerId || players.find((p) => p.hasCrown)?.playerId || null,
-      seatingDraw: seatingDrawPayload(players),
-      winnerPlayerId: null,
-      actionSequence: 0,
-      lastAction: null,
-      roundHistory: [],
-      roundWinnerPlayerId: null,
-      declarationPlayerId: null,
-      declarationSubmitted: false,
-      scoreWindowStage: null,
-      scoreWindowEndsAt: null,
-      scoreWindowTimer: null,
-      scoreWindowInterval: null,
-      pendingScoreSubmissions: {},
-      submittedScorePlayerIds: new Set(),
-      splitConfirmedPlayerIds: new Set(),
-      splitFinalized: false,
-      splitResult: null,
-      poolAmount: Math.max(0, Number(currentRoom.entryFee) || 0) * players.length,
-    };
+    const game = makeInitialGame(currentRoom, players);
     games[code] = game;
     dealRound(game);
-    broadcastGameState(code);
-  }, START_COUNTDOWN_SECONDS * 1000);
+    game.state = 'initial_deal';
+    const order = initialDealOrder(game);
+    const totalCards = order.length * 13;
+    const startedAt = Date.now();
+    const dealDurationMs = Math.max(
+      INITIAL_DEAL_FLIGHT_MS,
+      Math.max(0, totalCards - 1) * INITIAL_DEAL_GAP_MS + INITIAL_DEAL_FLIGHT_MS + 300,
+    );
+    const endsAt = startedAt + dealDurationMs;
+    game.initialDealStartedAt = startedAt;
+    game.initialDealEndsAt = endsAt;
+    const common = { startedAt, endsAt, dealDurationMs };
+
+    storeStartSequence(currentRoom, 'initial_deal', {
+      code,
+      ...publicStart,
+      players: publicPlayers(game.players),
+      dealOrderPlayerIds: order.map((player) => player.playerId),
+      cardFlightMs: INITIAL_DEAL_FLIGHT_MS,
+      cardGapMs: INITIAL_DEAL_GAP_MS,
+      startedAt,
+      endsAt,
+    });
+    for (const player of game.players) sendInitialDealToPlayer(code, game, player, common);
+
+    const finishTimer = setTimeout(() => {
+      const finalRoom = rooms[code];
+      const finalGame = games[code];
+      if (!finalRoom || !finalGame || finalGame.state !== 'initial_deal') return;
+      finalGame.state = 'playing';
+      finalRoom.gameStartScheduled = false;
+      storeStartSequence(finalRoom, 'complete', {
+        code,
+        completedAt: Date.now(),
+        highCardPlayerId: finalGame.highCardPlayerId || null,
+        dealerPlayerId: finalGame.players[finalGame.dealerIndex]?.playerId || null,
+      });
+      io.to(code).emit('initialDealCompleted', {
+        code,
+        completedAt: Date.now(),
+        dealerPlayerId: finalGame.players[finalGame.dealerIndex]?.playerId || null,
+      });
+      io.to(code).emit('turnStarted', {
+        code,
+        playerId: finalGame.players[finalGame.turnIndex]?.playerId || null,
+        turnIndex: finalGame.turnIndex,
+        startedAt: Date.now(),
+      });
+      broadcastGameState(code);
+    }, dealDurationMs);
+    currentRoom.startSequenceTimers.push(finishTimer);
+  });
+
   return true;
 }
 
@@ -1515,14 +1723,27 @@ io.on('connection', (socket) => {
     if (room.hostPlayerId === playerId) room.host = socket.id;
     emitRoomUpdate(code);
 
-    const gamePlayer = findGamePlayer(games[code], playerId, socket.id);
+    const game = games[code];
+    const gamePlayer = findGamePlayer(game, playerId, socket.id);
+    if (room.startSequence && room.startSequence.phase !== 'complete') {
+      socket.emit('startSequenceState', { ...room.startSequence, code });
+    }
     if (gamePlayer) {
-      sendGameStateToPlayer(code, gamePlayer);
-      sendLatestRoundResult(code, gamePlayer);
+      if (game?.state === 'initial_deal') {
+        sendInitialDealToPlayer(code, game, gamePlayer, {
+          startedAt: game.initialDealStartedAt || Date.now(),
+          endsAt: game.initialDealEndsAt || Date.now(),
+          dealDurationMs: Math.max(0, (game.initialDealEndsAt || Date.now()) - (game.initialDealStartedAt || Date.now())),
+          resume: true,
+        });
+      } else {
+        sendGameStateToPlayer(code, gamePlayer);
+        sendLatestRoundResult(code, gamePlayer);
+      }
     }
 
     socket.emit('room_rejoined', { code });
-    ack?.({ ok: true, code, inGame: !!games[code] });
+    ack?.({ ok: true, code, inGame: !!game, startPhase: room.startSequence?.phase || null });
   });
 
   socket.on('request_game_state', (payload = {}, ack) => {
@@ -1547,9 +1768,19 @@ io.on('connection', (socket) => {
     const roomPlayer = rooms[code]?.players.find((p) => p.playerId === player.playerId);
     if (roomPlayer) bindPlayerSocket(code, roomPlayer, socket);
 
-    sendGameStateToPlayer(code, player);
-    sendLatestRoundResult(code, player);
-    ack?.({ ok: true });
+    if (game.state === 'initial_deal') {
+      socket.emit('startSequenceState', { ...(rooms[code]?.startSequence || {}), code });
+      sendInitialDealToPlayer(code, game, player, {
+        startedAt: game.initialDealStartedAt || Date.now(),
+        endsAt: game.initialDealEndsAt || Date.now(),
+        dealDurationMs: Math.max(0, (game.initialDealEndsAt || Date.now()) - (game.initialDealStartedAt || Date.now())),
+        resume: true,
+      });
+    } else {
+      sendGameStateToPlayer(code, player);
+      sendLatestRoundResult(code, player);
+    }
+    ack?.({ ok: true, state: game.state });
   });
 
   socket.on('start_game', (payload = {}, ack) => {

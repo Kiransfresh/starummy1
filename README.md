@@ -1,15 +1,7 @@
-# Star Rummy 101 Railway Backend – 6 Player / 30s Score / Split
+# Star Rummy 101 — Railway Startup Animation Backend
 
-Deploy these files at the root of the GitHub repository connected to Railway.
+Upload these files to the GitHub/Railway backend repository and redeploy.
 
-Included server behavior:
-- fixed six-seat 101 Pool rooms,
-- clockwise/right-side turn order,
-- exactly 30-second post-declaration score window,
-- authoritative score submission and auto-finalization,
-- complete round history synchronization,
-- automatic 3-player / 2-player split eligibility,
-- unanimous split confirmation with exact pool arithmetic,
-- existing Joker / drop / reconnect / finish rules.
+This backend is matched to `Star_Rummy_101_FINAL_REFERENCE_START_ANIMATION_UI_FIXED.zip` and owns the synchronized 3-2-1 / toss / reveal / crown / dealer / initial deal sequence.
 
-Railway uses `Dockerfile` and `railway-package.json`; no frontend `src/` directory is required by the backend container.
+Health endpoint after deployment: `/`
