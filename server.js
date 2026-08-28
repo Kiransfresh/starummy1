@@ -326,26 +326,30 @@ function seatingRankValue(rank) {
   return Number(rank) || 0;
 }
 
-function createSeatingDraw(players = []) {
-  // Every real player draws from one shuffled natural deck. Equal ranks are
-  // resolved by drawing again so seating order is unambiguous. Ace is high.
-  // Seat positions are NOT assigned here: the highest-card player must choose
-  // the physical seat before the remaining players are placed to the right.
-  const deck = shuffle(buildDeck(5000).filter((card) => RANKS.includes(card.rank)));
-  const usedRanks = new Set();
-  const picks = [];
-  for (const player of players) {
-    let card = null;
-    while (deck.length && !card) {
-      const candidate = deck.shift();
-      if (!usedRanks.has(candidate.rank)) card = candidate;
-    }
-    if (!card) card = { id: `SEAT_${player.playerId}`, rank: '2', suit: 'C' };
-    usedRanks.add(card.rank);
-    picks.push({ player, card });
-  }
+function seatingSuitValue(suit) {
+  // The project already defines its deterministic natural-suit order as
+  // S, H, D, C. It is used only when two toss cards have the same rank so
+  // the server can produce one shared ordering without a client-side tie.
+  const index = SUITS.indexOf(suit);
+  return index < 0 ? 0 : SUITS.length - index;
+}
 
-  picks.sort((a, b) => seatingRankValue(b.card.rank) - seatingRankValue(a.card.rank));
+function createSeatingDraw(players = []) {
+  // Exactly one card per real player is taken from one server-shuffled natural
+  // 52-card deck. Rank is A > K > ... > 2. Equal ranks use the project's
+  // deterministic S > H > D > C order; no client performs randomness or
+  // winner comparison, and no toss card is silently replaced before reveal.
+  const deck = shuffle(buildDeck(5000).filter((card) => RANKS.includes(card.rank)));
+  const picks = players.map((player, index) => ({
+    player,
+    card: deck[index] || { id: `SEAT_${player.playerId}`, rank: '2', suit: 'C' },
+  }));
+
+  picks.sort((a, b) => {
+    const rankDiff = seatingRankValue(b.card.rank) - seatingRankValue(a.card.rank);
+    if (rankDiff) return rankDiff;
+    return seatingSuitValue(b.card.suit) - seatingSuitValue(a.card.suit);
+  });
   return picks.map(({ player, card }, rankOrder) => ({
     ...player,
     rankOrder,
@@ -368,29 +372,34 @@ function seatingDrawPayload(players = []) {
     }));
 }
 
-function finalizeSeatingChoice(room, chosenSeatIndex = 0) {
+function finalizeAutomaticSeating(room) {
   if (!room) return [];
-  const maxSeats = normaliseTableSize(room.tableSize);
-  const pending = (room.pendingSeatingOrder || room.players || [])
-    .filter((p) => p.connected !== false)
+  const pending = (room.pendingSeatingOrder || [])
     .sort((a, b) => (a.rankOrder ?? 99) - (b.rankOrder ?? 99));
   if (!pending.length) return [];
 
-  const chosen = Math.max(0, Math.min(maxSeats - 1, Math.trunc(Number(chosenSeatIndex) || 0)));
-  const seated = pending.map((player, rankOrder) => ({
-    ...player,
-    rankOrder,
-    // Next-highest goes to the right; continuing clockwise makes the lowest
-    // the occupied seat immediately to the highest player's left.
-    seatIndex: (chosen + rankOrder) % maxSeats,
-    hasCrown: rankOrder === 0,
-  }));
+  // Highest card owns seat-order priority. The next-highest is immediately to
+  // the RIGHT, then the next, continuing clockwise. With the local-player
+  // rotation used by the clients this also keeps 2-player rooms opposite and
+  // 3/4/5/6-player rooms evenly distributed with no fake/empty game seats.
+  const liveById = new Map((room.players || []).map((player) => [player.playerId, player]));
+  const seated = pending.map((rankedPlayer, rankOrder) => {
+    const live = liveById.get(rankedPlayer.playerId) || rankedPlayer;
+    return {
+      ...rankedPlayer,
+      ...live,
+      rankOrder,
+      seatIndex: rankOrder,
+      seatingCard: rankedPlayer.seatingCard,
+      hasCrown: rankOrder === 0,
+    };
+  });
 
-  room.players = seated.sort((a, b) => (a.seatIndex ?? 99) - (b.seatIndex ?? 99));
+  room.players = seated;
   room.pendingSeatingOrder = null;
   room.seatChoiceRequiredPlayerId = null;
-  room.highCardPlayerId = seated.find((p) => p.rankOrder === 0)?.playerId || null;
-  room.initialDealerPlayerId = seated.find((p) => p.rankOrder === seated.length - 1)?.playerId || null;
+  room.highCardPlayerId = seated[0]?.playerId || null;
+  room.initialDealerPlayerId = seated[seated.length - 1]?.playerId || null;
   return room.players;
 }
 
@@ -677,15 +686,26 @@ function recordGameAction(game, action) {
 function emitRoomUpdate(code) {
   const room = rooms[code];
   if (!room) return;
+  const phase = room.startSequence?.phase || null;
+  const revealCards = ['revealed', 'highest', 'seat_order', 'dealer', 'cleanup', 'initial_deal', 'complete'].includes(phase);
+  const revealHigh = ['highest', 'seat_order', 'dealer', 'cleanup', 'initial_deal', 'complete'].includes(phase);
+  const revealDealer = ['dealer', 'cleanup', 'initial_deal', 'complete'].includes(phase);
+  const pendingDraw = seatingDrawPayload(room.pendingSeatingOrder || []);
+  const publicDraw = revealCards
+    ? pendingDraw
+    : phase === 'toss_flying'
+      ? pendingDraw.map((pick) => ({ ...pick, card: null, hasCrown: false }))
+      : [];
+
   io.to(code).emit('room_update', {
     code,
     hostPlayerId: room.hostPlayerId || null,
     tableSize: normaliseTableSize(room.tableSize),
     minPlayers: normaliseMinPlayers(room.minPlayers, room.tableSize),
-    highCardPlayerId: room.highCardPlayerId || null,
-    dealerPlayerId: room.initialDealerPlayerId || null,
-    seatChoiceRequiredPlayerId: room.seatChoiceRequiredPlayerId || null,
-    seatingDraw: seatingDrawPayload(room.pendingSeatingOrder || room.players),
+    highCardPlayerId: revealHigh ? (room.highCardPlayerId || null) : null,
+    dealerPlayerId: revealDealer ? (room.initialDealerPlayerId || null) : null,
+    seatChoiceRequiredPlayerId: null,
+    seatingDraw: publicDraw.length ? publicDraw : (room.pendingSeatingOrder ? [] : seatingDrawPayload(room.players)),
     players: publicPlayers(room.players),
   });
 }
@@ -1379,6 +1399,33 @@ function sendInitialDealToPlayer(code, game, player, common = {}) {
   io.to(player.id).emit('initialDealStarted', buildInitialDealPayload(code, game, player.playerId, common));
 }
 
+function restoreStartOrGameState(code, room, player, socket) {
+  if (room?.startSequence && room.startSequence.phase !== 'complete') {
+    socket.emit('startSequenceState', { ...room.startSequence, code });
+  }
+
+  const game = games[code];
+  const gamePlayer = findGamePlayer(game, player?.playerId, socket.id);
+  if (!gamePlayer) return { inGame: false, state: null };
+
+  gamePlayer.id = socket.id;
+  gamePlayer.connected = true;
+  if (game?.state === 'initial_deal') {
+    const startedAt = game.initialDealStartedAt || Date.now();
+    const endsAt = game.initialDealEndsAt || Date.now();
+    sendInitialDealToPlayer(code, game, gamePlayer, {
+      startedAt,
+      endsAt,
+      dealDurationMs: Math.max(0, endsAt - startedAt),
+      resume: true,
+    });
+  } else {
+    sendGameStateToPlayer(code, gamePlayer);
+    sendLatestRoundResult(code, gamePlayer);
+  }
+  return { inGame: true, state: game?.state || null };
+}
+
 function scheduleGameStart(code) {
   const room = rooms[code];
   if (!room || games[code] || room.gameStartScheduled) return false;
@@ -1388,24 +1435,39 @@ function scheduleGameStart(code) {
     cancelPendingSeating(code, `Need at least ${requiredPlayers} connected real players to start.`);
     return false;
   }
-  if (connectedPlayers.some((p) => !Number.isInteger(p.seatIndex))) return false;
+
+  const rankedPlayers = (room.pendingSeatingOrder || [])
+    .filter((ranked) => connectedPlayers.some((player) => player.playerId === ranked.playerId))
+    .sort((a, b) => (a.rankOrder ?? 99) - (b.rankOrder ?? 99));
+  if (rankedPlayers.length !== connectedPlayers.length) return false;
 
   clearSeatingChoiceTimer(room);
   clearStartSequenceTimers(room);
   room.gameStartScheduled = true;
   room.startSequenceTimers = [];
 
-  const seatingDraw = seatingDrawPayload(connectedPlayers);
-  const publicStart = {
-    seatingDraw,
-    players: publicPlayers(connectedPlayers),
-    highCardPlayerId: room.highCardPlayerId,
-    dealerPlayerId: room.initialDealerPlayerId,
-  };
+  const participantIds = rankedPlayers.map((player) => player.playerId);
+  const preSeatPlayers = connectedPlayers.map((player) => ({
+    ...player,
+    seatIndex: null,
+    rankOrder: null,
+    seatingCard: null,
+    hasCrown: false,
+  }));
+  const fullSeatingDraw = seatingDrawPayload(rankedPlayers).map((pick) => ({ ...pick, seatIndex: null }));
+  const backOnlyDraw = fullSeatingDraw.map((pick) => ({
+    playerId: pick.playerId,
+    name: pick.name,
+    rankOrder: null,
+    seatIndex: null,
+    card: null,
+    hasCrown: false,
+  }));
+
   const countdownStartedAt = Date.now();
   const countdownEndsAt = countdownStartedAt + START_COUNTDOWN_SECONDS * 1000;
   const countdownPayload = {
-    ...publicStart,
+    players: publicPlayers(preSeatPlayers),
     countdown: START_COUNTDOWN_SECONDS,
     countdownStartedAt,
     countdownEndsAt,
@@ -1424,7 +1486,7 @@ function scheduleGameStart(code) {
     room.startSequenceTimers.push(timer);
   };
 
-  const playerCount = connectedPlayers.length;
+  const playerCount = rankedPlayers.length;
   const tossFlightWindow = Math.max(START_TOSS_FLIGHT_MS, (playerCount - 1) * START_TOSS_GAP_MS + START_TOSS_FLIGHT_MS);
   const tossAt = START_COUNTDOWN_SECONDS * 1000;
   const revealAt = tossAt + tossFlightWindow + 260;
@@ -1434,9 +1496,10 @@ function scheduleGameStart(code) {
   const clearAt = dealerAt + START_DEALER_MS + 720;
   const dealAt = clearAt + START_CLEAR_MS + 120;
 
-  addTimer(tossAt, (currentRoom) => {
+  addTimer(tossAt, () => {
     emitStartSequenceEvent(code, 'tossCardsGenerated', 'toss_flying', {
-      ...publicStart,
+      players: publicPlayers(preSeatPlayers),
+      seatingDraw: backOnlyDraw,
       cardFlightMs: START_TOSS_FLIGHT_MS,
       cardGapMs: START_TOSS_GAP_MS,
       startedAt: Date.now(),
@@ -1445,16 +1508,19 @@ function scheduleGameStart(code) {
 
   addTimer(revealAt, () => {
     emitStartSequenceEvent(code, 'tossCardsRevealed', 'revealed', {
-      ...publicStart,
+      players: publicPlayers(preSeatPlayers),
+      seatingDraw: fullSeatingDraw,
       flipMs: START_FLIP_MS,
       startedAt: Date.now(),
     });
   });
 
   addTimer(highestAt, () => {
-    const high = seatingDraw.find((pick) => pick.playerId === room.highCardPlayerId) || seatingDraw[0] || null;
+    const high = fullSeatingDraw.find((pick) => pick.playerId === room.highCardPlayerId) || fullSeatingDraw[0] || null;
     emitStartSequenceEvent(code, 'highestCardPlayer', 'highest', {
-      ...publicStart,
+      players: publicPlayers(preSeatPlayers),
+      seatingDraw: fullSeatingDraw,
+      highCardPlayerId: room.highCardPlayerId,
       playerId: room.highCardPlayerId,
       card: high?.card || null,
       highlightMs: START_HIGHEST_HOLD_MS,
@@ -1464,27 +1530,39 @@ function scheduleGameStart(code) {
   });
 
   addTimer(seatAt, (currentRoom) => {
+    finalizeAutomaticSeating(currentRoom);
+    const seatedDraw = seatingDrawPayload(currentRoom.players);
     emitStartSequenceEvent(code, 'seatOrder', 'seat_order', {
-      ...publicStart,
-      players: publicPlayers(currentRoom.players.filter((p) => p.connected !== false)),
+      players: publicPlayers(currentRoom.players),
+      seatingDraw: seatedDraw,
+      highCardPlayerId: currentRoom.highCardPlayerId,
+      seatOrderPlayerIds: currentRoom.players.map((player) => player.playerId),
       startedAt: Date.now(),
     });
+    emitRoomUpdate(code);
   });
 
-  addTimer(dealerAt, () => {
-    const low = seatingDraw.find((pick) => pick.playerId === room.initialDealerPlayerId) || seatingDraw[seatingDraw.length - 1] || null;
+  addTimer(dealerAt, (currentRoom) => {
+    const seatedDraw = seatingDrawPayload(currentRoom.players);
+    const low = seatedDraw.find((pick) => pick.playerId === currentRoom.initialDealerPlayerId) || seatedDraw[seatedDraw.length - 1] || null;
     emitStartSequenceEvent(code, 'dealerPlayerId', 'dealer', {
-      ...publicStart,
-      playerId: room.initialDealerPlayerId,
+      players: publicPlayers(currentRoom.players),
+      seatingDraw: seatedDraw,
+      highCardPlayerId: currentRoom.highCardPlayerId,
+      dealerPlayerId: currentRoom.initialDealerPlayerId,
+      playerId: currentRoom.initialDealerPlayerId,
       card: low?.card || null,
       dealerTravelMs: START_DEALER_MS,
       startedAt: Date.now(),
     });
   });
 
-  addTimer(clearAt, () => {
+  addTimer(clearAt, (currentRoom) => {
     emitStartSequenceEvent(code, 'selectionCardsCleared', 'cleanup', {
-      ...publicStart,
+      players: publicPlayers(currentRoom.players),
+      seatingDraw: seatingDrawPayload(currentRoom.players),
+      highCardPlayerId: currentRoom.highCardPlayerId,
+      dealerPlayerId: currentRoom.initialDealerPlayerId,
       clearMs: START_CLEAR_MS,
       startedAt: Date.now(),
     });
@@ -1492,11 +1570,19 @@ function scheduleGameStart(code) {
 
   addTimer(dealAt, (currentRoom) => {
     if (games[code]) return;
+    const liveById = new Map(currentRoom.players.map((player) => [player.playerId, player]));
+    const missingParticipant = participantIds.some((playerId) => liveById.get(playerId)?.connected === false || !liveById.has(playerId));
+    if (missingParticipant) {
+      currentRoom.gameStartScheduled = false;
+      cancelPendingSeating(code, 'A player disconnected before the initial deal. Reconnect and start again.');
+      return;
+    }
+
     const players = currentRoom.players
-      .filter((p) => p.connected !== false)
+      .filter((p) => participantIds.includes(p.playerId) && p.connected !== false)
       .sort((a, b) => (a.seatIndex ?? 99) - (b.seatIndex ?? 99))
       .map((p) => ({ ...p }));
-    if (players.length < normaliseMinPlayers(currentRoom.minPlayers, currentRoom.tableSize)) {
+    if (players.length < requiredPlayers) {
       currentRoom.gameStartScheduled = false;
       cancelPendingSeating(code, 'Too many players disconnected before the game started.');
       return;
@@ -1505,6 +1591,8 @@ function scheduleGameStart(code) {
     const game = makeInitialGame(currentRoom, players);
     games[code] = game;
     dealRound(game);
+    // dealRound creates the real hands/decks, but gameplay remains locked until
+    // every visual card-flight has completed on all clients.
     game.state = 'initial_deal';
     const order = initialDealOrder(game);
     const totalCards = order.length * 13;
@@ -1517,11 +1605,14 @@ function scheduleGameStart(code) {
     game.initialDealStartedAt = startedAt;
     game.initialDealEndsAt = endsAt;
     const common = { startedAt, endsAt, dealDurationMs };
+    const finalSeatingDraw = seatingDrawPayload(game.players);
 
     storeStartSequence(currentRoom, 'initial_deal', {
       code,
-      ...publicStart,
       players: publicPlayers(game.players),
+      seatingDraw: finalSeatingDraw,
+      highCardPlayerId: game.highCardPlayerId || null,
+      dealerPlayerId: game.players[game.dealerIndex]?.playerId || null,
       dealOrderPlayerIds: order.map((player) => player.playerId),
       cardFlightMs: INITIAL_DEAL_FLIGHT_MS,
       cardGapMs: INITIAL_DEAL_GAP_MS,
@@ -1541,6 +1632,8 @@ function scheduleGameStart(code) {
         completedAt: Date.now(),
         highCardPlayerId: finalGame.highCardPlayerId || null,
         dealerPlayerId: finalGame.players[finalGame.dealerIndex]?.playerId || null,
+        players: publicPlayers(finalGame.players),
+        seatingDraw: finalGame.seatingDraw || [],
       });
       io.to(code).emit('initialDealCompleted', {
         code,
@@ -1601,9 +1694,10 @@ io.on('connection', (socket) => {
       bindPlayerSocket(code, hostPlayer, socket);
       existing.host = socket.id;
       if (entryFee > 0) existing.entryFee = entryFee;
-      if (!games[code]) { existing.tableSize = tableSize; existing.minPlayers = minPlayers; }
+      if (!games[code] && !existing.gameStartScheduled) { existing.tableSize = tableSize; existing.minPlayers = minPlayers; }
       socket.emit('room_registered', { code, resumed: true });
       emitRoomUpdate(code);
+      restoreStartOrGameState(code, existing, hostPlayer, socket);
       const response = { ok: true, code, resumed: true, hostPlayerId: existing.hostPlayerId || null, entryFee: existing.entryFee || 0, tableSize: existing.tableSize, minPlayers: normaliseMinPlayers(existing.minPlayers, existing.tableSize), players: publicPlayers(existing.players) };
       ack?.(response);
       return;
@@ -1627,7 +1721,7 @@ io.on('connection', (socket) => {
     const code = normaliseCode(payload.code);
     const room = rooms[code];
     const roomTableSize = normaliseTableSize(room?.tableSize);
-    const valid = !!room && !games[code] && room.players.length < roomTableSize;
+    const valid = !!room && !games[code] && !room.gameStartScheduled && room.players.length < roomTableSize;
     const response = { code, valid, entryFee: room?.entryFee || 0, tableSize: roomTableSize, minPlayers: normaliseMinPlayers(room?.minPlayers, roomTableSize), playerCount: room?.players?.length || 0 };
     socket.emit('room_validated', response);
     ack?.({ ok: true, ...response });
@@ -1653,6 +1747,12 @@ io.on('connection', (socket) => {
     }
 
     let player = room.players.find((p) => p.playerId === playerId);
+    if (room.gameStartScheduled && !player) {
+      const response = { ok: false, message: 'This game is starting. New seats are locked until the session is restarted.' };
+      socket.emit('room_error', response);
+      ack?.(response);
+      return;
+    }
     if (games[code] && !player) {
       const response = { ok: false, message: 'This game has already started.' };
       socket.emit('room_error', response);
@@ -1677,11 +1777,7 @@ io.on('connection', (socket) => {
     emitRoomUpdate(code);
     socket.emit('room_joined', { code });
 
-    if (games[code]) {
-      const gamePlayer = findGamePlayer(games[code], playerId, socket.id);
-      sendGameStateToPlayer(code, gamePlayer);
-      sendLatestRoundResult(code, gamePlayer);
-    }
+    restoreStartOrGameState(code, room, player, socket);
 
     ack?.({ ok: true, code, hostPlayerId: room.hostPlayerId || null, entryFee: room.entryFee || 0, tableSize: normaliseTableSize(room.tableSize), minPlayers: normaliseMinPlayers(room.minPlayers, room.tableSize), players: publicPlayers(room.players), resumed: !!games[code] });
   });
@@ -1723,27 +1819,10 @@ io.on('connection', (socket) => {
     if (room.hostPlayerId === playerId) room.host = socket.id;
     emitRoomUpdate(code);
 
-    const game = games[code];
-    const gamePlayer = findGamePlayer(game, playerId, socket.id);
-    if (room.startSequence && room.startSequence.phase !== 'complete') {
-      socket.emit('startSequenceState', { ...room.startSequence, code });
-    }
-    if (gamePlayer) {
-      if (game?.state === 'initial_deal') {
-        sendInitialDealToPlayer(code, game, gamePlayer, {
-          startedAt: game.initialDealStartedAt || Date.now(),
-          endsAt: game.initialDealEndsAt || Date.now(),
-          dealDurationMs: Math.max(0, (game.initialDealEndsAt || Date.now()) - (game.initialDealStartedAt || Date.now())),
-          resume: true,
-        });
-      } else {
-        sendGameStateToPlayer(code, gamePlayer);
-        sendLatestRoundResult(code, gamePlayer);
-      }
-    }
+    const restored = restoreStartOrGameState(code, room, player, socket);
 
     socket.emit('room_rejoined', { code });
-    ack?.({ ok: true, code, inGame: !!game, startPhase: room.startSequence?.phase || null });
+    ack?.({ ok: true, code, inGame: restored.inGame, startPhase: room.startSequence?.phase || null });
   });
 
   socket.on('request_game_state', (payload = {}, ack) => {
@@ -1826,111 +1905,27 @@ io.on('connection', (socket) => {
       return;
     }
 
-    if (room.seatChoiceRequiredPlayerId && room.pendingSeatingOrder) {
-      ack?.({
-        ok: true,
-        code,
-        awaitingSeatChoice: true,
-        seatingDraw: seatingDrawPayload(room.pendingSeatingOrder),
-        highCardPlayerId: room.highCardPlayerId,
-        dealerPlayerId: room.initialDealerPlayerId,
-        seatChoiceRequiredPlayerId: room.seatChoiceRequiredPlayerId,
-        availableSeatCount: maxSeats,
-      });
-      return;
-    }
-
-    // Session seating: every REAL player draws. Highest gets the crown and the
-    // privilege to choose a physical seat. Only after that choice do the next
-    // highest players take successive seats to the RIGHT. Lowest is therefore
-    // immediately to the highest player's LEFT in the occupied-seat ring and
-    // becomes the first dealer; bots are never injected into multiplayer.
+    // Create the complete server-authoritative selection result once. Nothing
+    // is broadcast yet: clients first see the locked 3 → 2 → 1 countdown.
+    // Multiplayer rooms contain real players only; bots are never injected into multiplayer.
     const rankedPlayers = createSeatingDraw(connectedPlayers);
     room.pendingSeatingOrder = rankedPlayers;
-    room.players = rankedPlayers;
-    room.highCardPlayerId = rankedPlayers.find((p) => p.rankOrder === 0)?.playerId || null;
-    room.initialDealerPlayerId = rankedPlayers.find((p) => p.rankOrder === rankedPlayers.length - 1)?.playerId || null;
-    room.seatChoiceRequiredPlayerId = room.highCardPlayerId;
+    room.highCardPlayerId = rankedPlayers[0]?.playerId || null;
+    room.initialDealerPlayerId = rankedPlayers[rankedPlayers.length - 1]?.playerId || null;
+    room.seatChoiceRequiredPlayerId = null;
     clearSeatingChoiceTimer(room);
-    emitRoomUpdate(code);
 
-    const drawPayload = {
-      code,
-      seatingDraw: seatingDrawPayload(rankedPlayers),
-      highCardPlayerId: room.highCardPlayerId,
-      dealerPlayerId: room.initialDealerPlayerId,
-      seatChoiceRequiredPlayerId: room.seatChoiceRequiredPlayerId,
-      availableSeatCount: maxSeats,
-      chooseSeatSeconds: 12,
-    };
-    io.to(code).emit('seating_drawn', drawPayload);
-    ack?.({ ok: true, awaitingSeatChoice: true, ...drawPayload });
+    const scheduled = scheduleGameStart(code);
+    if (!scheduled) {
+      const response = { ok: false, message: 'Could not schedule the synchronized game start.' };
+      socket.emit('game_error', response);
+      ack?.(response);
+      return;
+    }
 
-    // Do not freeze the room if the crown player walks away from the choice.
-    // Seat 1 is a deterministic fallback after 12 seconds.
-    room.seatingChoiceTimer = setTimeout(() => {
-      const current = rooms[code];
-      if (!current || games[code] || !current.seatChoiceRequiredPlayerId) return;
-      const required = normaliseMinPlayers(current.minPlayers, current.tableSize);
-      if (current.players.filter((p) => p.connected !== false).length < required) {
-        cancelPendingSeating(code, `Need at least ${required} connected real players to continue.`);
-        return;
-      }
-      finalizeSeatingChoice(current, 0);
-      emitRoomUpdate(code);
-      scheduleGameStart(code);
-    }, 12000);
+    ack?.({ ok: true, code, countdown: START_COUNTDOWN_SECONDS });
   });
 
-  socket.on('choose_seat', (payload = {}, ack) => {
-    const code = normaliseCode(payload.code);
-    const playerId = String(payload.playerId || '').trim();
-    const room = rooms[code];
-    if (!room || games[code]) {
-      ack?.({ ok: false, message: 'Room is no longer waiting for seating.' });
-      return;
-    }
-    if (!room.seatChoiceRequiredPlayerId || !room.pendingSeatingOrder) {
-      ack?.({ ok: false, message: 'No seating choice is pending.' });
-      return;
-    }
-    if (playerId !== room.seatChoiceRequiredPlayerId) {
-      ack?.({ ok: false, message: 'Only the highest-card crown player can choose the seat.' });
-      return;
-    }
-    const chooser = room.players.find((p) => p.playerId === playerId);
-    if (!chooser || chooser.connected === false) {
-      ack?.({ ok: false, message: 'Crown player is not connected.' });
-      return;
-    }
-    const maxSeats = normaliseTableSize(room.tableSize);
-    const requested = Number(payload.seatIndex);
-    if (!Number.isInteger(requested) || requested < 0 || requested >= maxSeats) {
-      ack?.({ ok: false, message: `Choose a seat from 1 to ${maxSeats}.` });
-      return;
-    }
-    const required = normaliseMinPlayers(room.minPlayers, room.tableSize);
-    if (room.players.filter((p) => p.connected !== false).length < required) {
-      cancelPendingSeating(code, `Need at least ${required} connected real players to continue.`);
-      ack?.({ ok: false, message: `Need at least ${required} connected real players to continue.` });
-      return;
-    }
-
-    clearSeatingChoiceTimer(room);
-    const seatedPlayers = finalizeSeatingChoice(room, requested);
-    emitRoomUpdate(code);
-    const response = {
-      ok: true,
-      code,
-      chosenSeatIndex: requested,
-      countdown: START_COUNTDOWN_SECONDS,
-      seatingDraw: seatingDrawPayload(seatedPlayers),
-      highCardPlayerId: room.highCardPlayerId,
-      dealerPlayerId: room.initialDealerPlayerId,
-    };
-    ack?.(response);
-    scheduleGameStart(code);
-  });
   socket.on('draw_card', (payload = {}, ack) => {
     const code = normaliseCode(payload.code);
     const playerId = String(payload.playerId || '').trim();
