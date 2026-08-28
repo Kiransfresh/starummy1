@@ -254,12 +254,14 @@ const START_COUNTDOWN_SECONDS = 3;
 const START_TOSS_FLIGHT_MS = 320;
 const START_TOSS_GAP_MS = 110;
 const START_FLIP_MS = 400;
+const START_REVEAL_HOLD_MS = 850;
 const START_HIGHEST_HOLD_MS = 1050;
 const START_CROWN_MS = 620;
 const START_DEALER_MS = 520;
 const START_CLEAR_MS = 380;
 const INITIAL_DEAL_FLIGHT_MS = 290;
 const INITIAL_DEAL_GAP_MS = 95;
+const INITIAL_DECK_SETUP_MS = 760;
 const SCORE_WINDOW_SECONDS = 30;
 const ROUND_RESULT_SECONDS = 8;
 const SPLIT_COUNTS = new Set([2, 3]);
@@ -285,7 +287,11 @@ const SUITS = ['S', 'H', 'D', 'C'];
 const RANKS = ['A', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K'];
 
 function normaliseCode(code) {
-  return String(code || '').trim().toUpperCase();
+  return String(code || '').replace(/\D/g, '').slice(0, 4);
+}
+
+function isValidRoomCode(code) {
+  return /^\d{4}$/.test(String(code || ''));
 }
 
 function buildDeck(offset = 0) {
@@ -628,6 +634,9 @@ function dealRound(game, incrementRound = true) {
   game.handsByPlayerId = handsByPlayerId;
   game.discardPile = firstDiscard ? [firstDiscard] : [];
   game.lastDiscardByPlayerId = {};
+  // Per-player action history for the current round. This is public table
+  // information: tapping a profile can show every card that player discarded.
+  game.discardHistoryByPlayerId = Object.fromEntries(game.players.map((player) => [player.playerId, []]));
   game.wildJoker = wildJoker;
   game.droppedPlayerIds = new Set();
   game.drawnPlayerIds = new Set();
@@ -649,7 +658,7 @@ function dealRound(game, incrementRound = true) {
   game.splitConfirmedPlayerIds = new Set();
   game.lastRoundDetails = null;
 
-  // First deal belongs to the LOWEST seating-card player (last seat).
+  // First deal belongs to the HIGHEST seating-card player (crown).
   // Later rounds rotate the dealer one active seat to the right. The first turn
   // of each round is the active player immediately to the dealer's right.
   if (previousRoundNumber === 0 && Number.isInteger(game.initialDealerIndex)) {
@@ -673,6 +682,14 @@ function publicPlayers(players) {
     seatingCard: p.seatingCard || null,
     hasCrown: !!p.hasCrown,
   }));
+}
+
+function recordPlayerDiscard(game, playerId, card) {
+  if (!game || !playerId || !card) return;
+  if (!game.discardHistoryByPlayerId) game.discardHistoryByPlayerId = {};
+  if (!Array.isArray(game.discardHistoryByPlayerId[playerId])) game.discardHistoryByPlayerId[playerId] = [];
+  game.discardHistoryByPlayerId[playerId].push(card);
+  game.lastDiscardByPlayerId[playerId] = card;
 }
 
 function recordGameAction(game, action) {
@@ -771,6 +788,7 @@ function buildSnapshot(game, forPlayerId) {
     roundPoints: game.roundPointsByPlayerId[p.playerId] || 0,
     lastRoundPoints: game.lastRoundPointsByPlayerId?.[p.playerId] || 0,
     lastDiscard: game.lastDiscardByPlayerId?.[p.playerId] || null,
+    discardHistory: [...(game.discardHistoryByPlayerId?.[p.playerId] || [])],
     dropped: game.droppedPlayerIds.has(p.playerId),
     isEliminated: isEliminated(game, p.playerId),
     scoreSubmitted: game.submittedScorePlayerIds?.has(p.playerId) || false,
@@ -876,6 +894,8 @@ function buildRoundResult(code, game, forPlayerId, details = {}) {
       dropped: game.droppedPlayerIds.has(player.playerId),
       isEliminated: isEliminated(game, player.playerId),
       handSize: (game.handsByPlayerId[player.playerId] || []).length,
+      lastDiscard: game.lastDiscardByPlayerId?.[player.playerId] || null,
+      discardHistory: [...(game.discardHistoryByPlayerId?.[player.playerId] || [])],
     })),
   };
 }
@@ -1020,7 +1040,7 @@ function beginDeclarationWindow(code, actor, cardId) {
 
   const [discardedCard] = hand.splice(discardIndex, 1);
   game.discardPile.push(discardedCard);
-  game.lastDiscardByPlayerId[actor.playerId] = discardedCard;
+  recordPlayerDiscard(game, actor.playerId, discardedCard);
   game.handsByPlayerId[actor.playerId] = hand;
   game.state = 'score_window';
   game.scoreWindowStage = 'declare';
@@ -1338,6 +1358,7 @@ function makeInitialGame(currentRoom, players) {
     lastRoundPointsByPlayerId: Object.fromEntries(players.map((player) => [player.playerId, 0])),
     droppedPlayerIds: new Set(),
     lastDiscardByPlayerId: {},
+    discardHistoryByPlayerId: {},
     roundNumber: 0,
     dealerIndex: initialDealerIndex >= 0 ? initialDealerIndex : Math.max(0, players.length - 1),
     initialDealerIndex: initialDealerIndex >= 0 ? initialDealerIndex : Math.max(0, players.length - 1),
@@ -1389,6 +1410,9 @@ function buildInitialDealPayload(code, game, playerId, common = {}) {
     cardsPerPlayer: 13,
     cardFlightMs: INITIAL_DEAL_FLIGHT_MS,
     cardGapMs: INITIAL_DEAL_GAP_MS,
+    deckSize: game.deck.length,
+    openCard: game.discardPile[game.discardPile.length - 1] || null,
+    wildJoker: game.wildJoker || null,
     hand: [...(game.handsByPlayerId[playerId] || [])],
     ...common,
   };
@@ -1490,7 +1514,9 @@ function scheduleGameStart(code) {
   const tossFlightWindow = Math.max(START_TOSS_FLIGHT_MS, (playerCount - 1) * START_TOSS_GAP_MS + START_TOSS_FLIGHT_MS);
   const tossAt = START_COUNTDOWN_SECONDS * 1000;
   const revealAt = tossAt + tossFlightWindow + 260;
-  const highestAt = revealAt + START_FLIP_MS + 220;
+  // Keep every face-up toss card visible long enough for all clients to read
+  // the complete table before the authoritative high-card result is shown.
+  const highestAt = revealAt + START_FLIP_MS + START_REVEAL_HOLD_MS;
   const seatAt = highestAt + START_HIGHEST_HOLD_MS + START_CROWN_MS;
   const dealerAt = seatAt + 430;
   const clearAt = dealerAt + START_DEALER_MS + 720;
@@ -1597,14 +1623,20 @@ function scheduleGameStart(code) {
     const order = initialDealOrder(game);
     const totalCards = order.length * 13;
     const startedAt = Date.now();
-    const dealDurationMs = Math.max(
+    const dealCardsDurationMs = Math.max(
       INITIAL_DEAL_FLIGHT_MS,
-      Math.max(0, totalCards - 1) * INITIAL_DEAL_GAP_MS + INITIAL_DEAL_FLIGHT_MS + 300,
+      Math.max(0, totalCards - 1) * INITIAL_DEAL_GAP_MS + INITIAL_DEAL_FLIGHT_MS + 160,
     );
+    // After the final hand card lands, visibly settle the closed deck, open card
+    // and joker into their normal table positions before the first turn starts.
+    const dealDurationMs = dealCardsDurationMs + INITIAL_DECK_SETUP_MS;
     const endsAt = startedAt + dealDurationMs;
     game.initialDealStartedAt = startedAt;
     game.initialDealEndsAt = endsAt;
-    const common = { startedAt, endsAt, dealDurationMs };
+    const common = {
+      startedAt, endsAt, dealDurationMs, dealCardsDurationMs,
+      deckSetupMs: INITIAL_DECK_SETUP_MS,
+    };
     const finalSeatingDraw = seatingDrawPayload(game.players);
 
     storeStartSequence(currentRoom, 'initial_deal', {
@@ -1616,6 +1648,11 @@ function scheduleGameStart(code) {
       dealOrderPlayerIds: order.map((player) => player.playerId),
       cardFlightMs: INITIAL_DEAL_FLIGHT_MS,
       cardGapMs: INITIAL_DEAL_GAP_MS,
+      deckSize: game.deck.length,
+      openCard: game.discardPile[game.discardPile.length - 1] || null,
+      wildJoker: game.wildJoker || null,
+      dealCardsDurationMs,
+      deckSetupMs: INITIAL_DECK_SETUP_MS,
       startedAt,
       endsAt,
     });
@@ -1669,8 +1706,8 @@ io.on('connection', (socket) => {
     const tableSize = normaliseTableSize(payload.tableSize);
     const minPlayers = normaliseMinPlayers(payload.minPlayers, tableSize);
 
-    if (!code || !playerId) {
-      const response = { ok: false, message: 'Room code and player identity are required.' };
+    if (!isValidRoomCode(code) || !playerId) {
+      const response = { ok: false, message: 'A 4-digit numeric room code and player identity are required.' };
       socket.emit('room_error', response);
       ack?.(response);
       return;
@@ -1719,9 +1756,9 @@ io.on('connection', (socket) => {
 
   socket.on('validate_room', (payload = {}, ack) => {
     const code = normaliseCode(payload.code);
-    const room = rooms[code];
+    const room = isValidRoomCode(code) ? rooms[code] : null;
     const roomTableSize = normaliseTableSize(room?.tableSize);
-    const valid = !!room && !games[code] && !room.gameStartScheduled && room.players.length < roomTableSize;
+    const valid = isValidRoomCode(code) && !!room && !games[code] && !room.gameStartScheduled && room.players.length < roomTableSize;
     const response = { code, valid, entryFee: room?.entryFee || 0, tableSize: roomTableSize, minPlayers: normaliseMinPlayers(room?.minPlayers, roomTableSize), playerCount: room?.players?.length || 0 };
     socket.emit('room_validated', response);
     ack?.({ ok: true, ...response });
@@ -1733,8 +1770,8 @@ io.on('connection', (socket) => {
     const playerName = String(payload.playerName || 'Player').trim().slice(0, 40) || 'Player';
     const room = rooms[code];
 
-    if (!code || !playerId) {
-      const response = { ok: false, message: 'Enter a valid room code.' };
+    if (!isValidRoomCode(code) || !playerId) {
+      const response = { ok: false, message: 'Enter a valid 4-digit numeric room code.' };
       socket.emit('room_error', response);
       ack?.(response);
       return;
@@ -2062,7 +2099,7 @@ io.on('connection', (socket) => {
 
     const [card] = hand.splice(cardIndex, 1);
     game.discardPile.push(card);
-    game.lastDiscardByPlayerId[actor.playerId] = card;
+    recordPlayerDiscard(game, actor.playerId, card);
     recordGameAction(game, {
       type: 'discard',
       playerId: actor.playerId,
