@@ -399,7 +399,7 @@ function finalizeAutomaticSeating(room) {
   room.pendingSeatingOrder = null;
   room.seatChoiceRequiredPlayerId = null;
   room.highCardPlayerId = seated[0]?.playerId || null;
-  room.initialDealerPlayerId = seated[seated.length - 1]?.playerId || null;
+  room.initialDealerPlayerId = seated[0]?.playerId || null;
   return room.players;
 }
 
@@ -1544,14 +1544,14 @@ function scheduleGameStart(code) {
 
   addTimer(dealerAt, (currentRoom) => {
     const seatedDraw = seatingDrawPayload(currentRoom.players);
-    const low = seatedDraw.find((pick) => pick.playerId === currentRoom.initialDealerPlayerId) || seatedDraw[seatedDraw.length - 1] || null;
+    const dealerPick = seatedDraw.find((pick) => pick.playerId === currentRoom.initialDealerPlayerId) || seatedDraw[0] || null;
     emitStartSequenceEvent(code, 'dealerPlayerId', 'dealer', {
       players: publicPlayers(currentRoom.players),
       seatingDraw: seatedDraw,
       highCardPlayerId: currentRoom.highCardPlayerId,
       dealerPlayerId: currentRoom.initialDealerPlayerId,
       playerId: currentRoom.initialDealerPlayerId,
-      card: low?.card || null,
+      card: dealerPick?.card || null,
       dealerTravelMs: START_DEALER_MS,
       startedAt: Date.now(),
     });
@@ -1911,7 +1911,7 @@ io.on('connection', (socket) => {
     const rankedPlayers = createSeatingDraw(connectedPlayers);
     room.pendingSeatingOrder = rankedPlayers;
     room.highCardPlayerId = rankedPlayers[0]?.playerId || null;
-    room.initialDealerPlayerId = rankedPlayers[rankedPlayers.length - 1]?.playerId || null;
+    room.initialDealerPlayerId = rankedPlayers[0]?.playerId || null;
     room.seatChoiceRequiredPlayerId = null;
     clearSeatingChoiceTimer(room);
 

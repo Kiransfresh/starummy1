@@ -1,7 +1,2 @@
-# Star Rummy 101 — Railway Startup Animation Backend
-
-Upload these files to the GitHub/Railway backend repository and redeploy.
-
-This backend is matched to `Star_Rummy_101_FINAL_REFERENCE_START_ANIMATION_UI_FIXED.zip` and owns the synchronized 3-2-1 / toss / reveal / crown / dealer / initial deal sequence.
-
-Health endpoint after deployment: `/`
+# Star Rummy 101 Railway backend — fixed-profile reference animation
+Deploy this backend with the matching final UI ZIP. The server owns the synchronized 3-2-1 start, natural one-card toss, reveal, highest-card result, lowest-card first dealer, initial 13-card round-robin deal, reconnect state, per-player latest discard and turn start. Profile movement is a UI-only behavior and is now intentionally disabled to match the supplied reference video.

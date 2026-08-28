@@ -1,0 +1,67 @@
+STAR RUMMY 101 - REFERENCE VIDEO START ANIMATION / REAL TABLE FIX
+Date: 2026-08-28
+
+USER REQUIREMENT
+Keep the existing table, timers, controls, scoring and normal 101 gameplay unchanged.
+Only add the reference-video first-session sequence on top of the existing GameScreen.
+
+ROOT CAUSE FIXED
+The earlier StartingDealerAnimation rendered a separate fixed full-screen table/background while MatchLobbyScreen stayed active. That made the feature look missing/wrong in the APK and did not visually match the supplied videos, which keep the actual game table/player UI visible.
+
+IMPLEMENTED
+1. MatchLobbyScreen switches to GameScreen as soon as authoritative gameStarting/countdown arrives.
+2. Authoritative start state is handed to GameScreen through Zustand and restored on reconnect.
+3. StartingDealerAnimation is now a transparent pointer-events:none card-only layer.
+4. No duplicate table background, duplicate avatars, popup screen, or blocking overlay.
+5. Toss cards use the actual table/avatar DOM positions through tableRef, aiRefs and localAvatarRef.
+6. 2-player fallback is bottom vs top; 6-player fallback is an even oval.
+7. Center deck -> sequential face-down toss -> 3D reveal -> highest lift/glow -> compact crown flight -> lowest highlight -> separate dealer D flight -> cleanup -> 13-round deal.
+8. Initial 13-card deal uses the server deal order, timings and the current user's authoritative hand. Opponents remain face-down.
+9. Local hand target uses the actual hand container and keeps usable card sizing for 6-player rooms.
+10. Seat-order changes animate smoothly instead of visually teleporting.
+11. Game interaction remains locked while first-session animation is active. Normal turn timer starts only after server initialDealCompleted/turnStarted/game_state.
+12. Round 1 is not dealt a second time locally. Later rounds use the existing round flow unchanged.
+13. Crown = highest-card player. D = lowest-card first dealer. Roles stay separate.
+
+SERVER AUTHORITY
+Existing patched server remains authoritative for:
+- gameStarting
+- tossCardsGenerated
+- tossCardsRevealed
+- highestCardPlayer
+- seatOrder
+- dealerPlayerId
+- selectionCardsCleared
+- initialDealStarted
+- initialDealCompleted
+- turnStarted
+
+TIMING
+Countdown: 3 seconds
+Toss flight: 320ms
+Toss gap: 110ms
+Flip: 400ms
+Highest hold: 1050ms
+Crown: 620ms
+Dealer D: 520ms
+Cleanup: 380ms
+Initial deal flight: 290ms
+Initial deal gap: 95ms
+
+VERIFICATION COMPLETED IN THIS ENVIRONMENT
+- server.js syntax: PASS
+- StartingDealerAnimation.jsx parse: PASS
+- GameScreen.jsx parse: PASS
+- MatchLobbyScreen.jsx parse: PASS
+- PlayersAroundTable.jsx parse: PASS
+- store.js parse: PASS
+- dependency-free regression tests: 64/64 PASS
+- authoritative server toss/seating/dealer stress test:
+  2 players x 1000 PASS
+  3 players x 1000 PASS
+  4 players x 1000 PASS
+  5 players x 1000 PASS
+  6 players x 1000 PASS
+
+APK BUILD NOTE
+This sandbox does not contain the project's installed npm dependencies or prebuilt web dist assets, so a new APK binary cannot be generated here without installing dependencies. The project already includes BUILD_LATEST_APK_WINDOWS.bat / BUILD_APK_ZERO_ISSUE_WINDOWS.bat. Rebuild/sync the included source before installing the APK; an older already-installed APK will not contain these new React assets.

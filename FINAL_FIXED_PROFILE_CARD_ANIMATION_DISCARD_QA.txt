@@ -1,0 +1,26 @@
+STAR RUMMY 101 - FINAL FIXED-PROFILE REFERENCE VIDEO ANIMATION
+Date: 2026-08-28
+
+REFERENCE MATCH
+- Profiles stay fixed exactly like the supplied 6-player reference; no seat/profile sliding during toss ranking.
+- Countdown stays on the real existing table.
+- Center stack -> one back card per real player -> all reveal -> server highest highlight/crown -> server lowest dealer D -> temporary cards clear -> 13-card round-robin flight.
+- 2-player remains bottom vs top; 3/4/5/6 use the existing real-player table positions.
+- Existing timer UI, controls, scoring, declarations and normal gameplay are unchanged.
+
+VISUAL FIXES
+- Added persistent latest-discard card beside every opponent profile.
+- Added current user's latest-discard card beside the local profile.
+- Removed the empty transparent dashed dummy card from OPEN DECK when no discard exists.
+- Center deck remains visible while toss/13-card animations run and has a subtle deal pulse.
+- Create Room synchronous 4-digit room-code fix remains included.
+
+SERVER AUTHORITY
+- Server still owns toss cards, reveal, highest-card player, seating/ranking, lowest-card dealer, 13-card hands, turn start and reconnect state.
+- Crown remains the highest-card result.
+- Dealer D remains the lowest-card player, matching the supplied reference where the lowest 2-card player is shown as "last, and the dealer".
+
+QA
+- 72 dependency-free regression tests: PASS.
+- server.js syntax check: PASS.
+- Live Socket.IO tests are included but require npm dependencies/socket.io-client, which are not installed in this sandbox.
