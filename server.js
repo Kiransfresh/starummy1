@@ -263,6 +263,8 @@ const INITIAL_DEAL_FLIGHT_MS = 290;
 const INITIAL_DEAL_GAP_MS = 95;
 const INITIAL_DECK_SETUP_MS = 760;
 const SCORE_WINDOW_SECONDS = 30;
+const TURN_MAIN_SECONDS = 60;
+const TURN_EXTRA_SECONDS = 30;
 const ROUND_RESULT_SECONDS = 8;
 const SPLIT_COUNTS = new Set([2, 3]);
 
@@ -538,6 +540,39 @@ function activeGamePlayers(game) {
   return game.players.filter((player) => !isEliminated(game, player.playerId));
 }
 
+// Dealer/crown rotation follows the ORIGINAL seating-card ranking for the
+// whole session: highest card gets Round 1, next-lower card gets Round 2,
+// continuing until every active player has had the crown, then it loops.
+function dealerRotationOrder(game) {
+  const configured = Array.isArray(game?.dealerRotationPlayerIds)
+    ? game.dealerRotationPlayerIds.filter(Boolean)
+    : [];
+  if (configured.length) return configured;
+  return [...(game?.players || [])]
+    .sort((a, b) => (a.rankOrder ?? 99) - (b.rankOrder ?? 99))
+    .map((player) => player.playerId);
+}
+
+function nextDealerIndexByTossRank(game, fromIndex) {
+  const order = dealerRotationOrder(game);
+  if (!order.length) return -1;
+  const currentId = game.players[fromIndex]?.playerId || null;
+  const currentOrderIndex = Math.max(-1, order.indexOf(currentId));
+  for (let offset = 1; offset <= order.length; offset += 1) {
+    const playerId = order[(currentOrderIndex + offset + order.length) % order.length];
+    const playerIndex = game.players.findIndex((player) => player.playerId === playerId);
+    if (playerIndex < 0) continue;
+    const player = game.players[playerIndex];
+    if (!isEliminated(game, playerId) && player.connected !== false) return playerIndex;
+  }
+  return Number.isInteger(fromIndex) ? fromIndex : -1;
+}
+
+function syncDealerCrown(game) {
+  const dealerId = game?.players?.[game.dealerIndex]?.playerId || null;
+  for (const player of game?.players || []) player.hasCrown = !!dealerId && player.playerId === dealerId;
+}
+
 function safePoolAmount(game) {
   return Math.max(0, Number(game.poolAmount) || 0);
 }
@@ -658,15 +693,17 @@ function dealRound(game, incrementRound = true) {
   game.splitConfirmedPlayerIds = new Set();
   game.lastRoundDetails = null;
 
-  // First deal belongs to the HIGHEST seating-card player (crown).
-  // Later rounds rotate the dealer one active seat to the right. The first turn
-  // of each round is the active player immediately to the dealer's right.
+  // First deal belongs to the HIGHEST seating-card player (crown). Later
+  // rounds follow that same original toss ranking: next-lower card, then the
+  // next-lower card, until all active players have had the crown, then loop.
   if (previousRoundNumber === 0 && Number.isInteger(game.initialDealerIndex)) {
     game.dealerIndex = game.initialDealerIndex;
   } else if (previousRoundNumber > 0) {
-    const nextDealer = nextPlayableIndex(game, Number.isInteger(game.dealerIndex) ? game.dealerIndex : -1);
+    const nextDealer = nextDealerIndexByTossRank(game, Number.isInteger(game.dealerIndex) ? game.dealerIndex : -1);
     if (nextDealer >= 0) game.dealerIndex = nextDealer;
   }
+  syncDealerCrown(game);
+  // The first turn still begins with the active player on the dealer's right.
   const firstTurn = nextPlayableIndex(game, Number.isInteger(game.dealerIndex) ? game.dealerIndex : -1);
   game.turnIndex = firstTurn >= 0 ? firstTurn : (game.dealerIndex >= 0 ? game.dealerIndex : 0);
 }
@@ -818,6 +855,9 @@ function buildSnapshot(game, forPlayerId) {
     scoreWindowStage: game.scoreWindowStage || null,
     scoreWindowEndsAt: game.scoreWindowEndsAt || null,
     scoreWindowSeconds: SCORE_WINDOW_SECONDS,
+    turnMainSeconds: TURN_MAIN_SECONDS,
+    turnExtraSeconds: TURN_EXTRA_SECONDS,
+    turnTotalSeconds: TURN_MAIN_SECONDS + TURN_EXTRA_SECONDS,
     scoreWindowSecondsRemaining: game.scoreWindowEndsAt ? Math.max(0, Math.ceil((game.scoreWindowEndsAt - Date.now()) / 1000)) : null,
     requiredScorePlayerIds: scoreWindowRequiredPlayerIds(game),
     submittedScorePlayerIds: [...(game.submittedScorePlayerIds || new Set())],
@@ -1364,6 +1404,9 @@ function makeInitialGame(currentRoom, players) {
     initialDealerIndex: initialDealerIndex >= 0 ? initialDealerIndex : Math.max(0, players.length - 1),
     highCardPlayerId: currentRoom.highCardPlayerId || players.find((p) => p.hasCrown)?.playerId || null,
     seatingDraw: seatingDrawPayload(players),
+    dealerRotationPlayerIds: seatingDrawPayload(players)
+      .sort((a, b) => (a.rankOrder ?? 99) - (b.rankOrder ?? 99))
+      .map((player) => player.playerId),
     winnerPlayerId: null,
     actionSequence: 0,
     lastAction: null,
@@ -1627,15 +1670,17 @@ function scheduleGameStart(code) {
       INITIAL_DEAL_FLIGHT_MS,
       Math.max(0, totalCards - 1) * INITIAL_DEAL_GAP_MS + INITIAL_DEAL_FLIGHT_MS + 160,
     );
-    // After the final hand card lands, visibly settle the closed deck, open card
-    // and joker into their normal table positions before the first turn starts.
-    const dealDurationMs = dealCardsDurationMs + INITIAL_DECK_SETUP_MS;
+    // Match the reference table flow: settle the closed deck, open card and joker
+    // first, then begin the visible 13-card round-robin deal. Gameplay stays locked
+    // until that complete visual sequence is over.
+    const dealDurationMs = INITIAL_DECK_SETUP_MS + dealCardsDurationMs;
     const endsAt = startedAt + dealDurationMs;
     game.initialDealStartedAt = startedAt;
     game.initialDealEndsAt = endsAt;
     const common = {
       startedAt, endsAt, dealDurationMs, dealCardsDurationMs,
       deckSetupMs: INITIAL_DECK_SETUP_MS,
+      dealStartDelayMs: INITIAL_DECK_SETUP_MS,
     };
     const finalSeatingDraw = seatingDrawPayload(game.players);
 
@@ -1653,6 +1698,7 @@ function scheduleGameStart(code) {
       wildJoker: game.wildJoker || null,
       dealCardsDurationMs,
       deckSetupMs: INITIAL_DECK_SETUP_MS,
+      dealStartDelayMs: INITIAL_DECK_SETUP_MS,
       startedAt,
       endsAt,
     });
@@ -1682,6 +1728,9 @@ function scheduleGameStart(code) {
         playerId: finalGame.players[finalGame.turnIndex]?.playerId || null,
         turnIndex: finalGame.turnIndex,
         startedAt: Date.now(),
+        mainSeconds: TURN_MAIN_SECONDS,
+        extraSeconds: TURN_EXTRA_SECONDS,
+        totalSeconds: TURN_MAIN_SECONDS + TURN_EXTRA_SECONDS,
       });
       broadcastGameState(code);
     }, dealDurationMs);
