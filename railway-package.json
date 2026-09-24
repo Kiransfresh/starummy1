@@ -1,6 +1,6 @@
 {
   "name": "star-rummy-101-socket-server",
-  "version": "1.0.0",
+  "version": "1.4.0",
   "private": true,
   "type": "module",
   "engines": {

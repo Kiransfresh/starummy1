@@ -2,11 +2,11 @@
 import express from 'express';
 import { createServer } from 'http';
 import { Server } from 'socket.io';
+import { randomInt } from 'node:crypto';
+import { calculateFirstCardScore, validTwoDeckCards } from './src/game/customPoolRules.js';
 
 
-// Railway-safe 101-pool rules. These are intentionally embedded in the
-// socket server so the production backend does not depend on frontend src/
-// files being present in the Docker/GitHub build context.
+// Core 101 rules plus shared custom first-card rules shipped in the Railway image.
 const RULE_HIGH_CARDS = new Set(['A', '10', 'J', 'Q', 'K']);
 
 function ruleIsPrintedJoker(card) {
@@ -287,6 +287,9 @@ const disconnectTimers = new Map();
 
 const SUITS = ['S', 'H', 'D', 'C'];
 const RANKS = ['A', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K'];
+// Official high-card toss tie-break used by this 101 Pool table. Card rank is
+// compared first; equal ranks are resolved by the suit shape shown on the card.
+const SEATING_SUIT_PRIORITY = Object.freeze({ S: 4, H: 3, D: 2, C: 1 });
 
 function normaliseCode(code) {
   return String(code || '').replace(/\D/g, '').slice(0, 4);
@@ -314,13 +317,17 @@ function buildDeck(offset = 0) {
 }
 
 function buildTwoDecks() {
-  return [...buildDeck(0), ...buildDeck(100)];
+  const cards = [...buildDeck(0), ...buildDeck(100),
+    { id:'JKR_extra_0', rank:'JKR', suit:'JOKER', isJoker:true },
+    { id:'JKR_extra_1', rank:'JKR', suit:'JOKER', isJoker:true }];
+  if (!validTwoDeckCards(cards)) throw new Error('Invalid two-deck inventory');
+  return cards;
 }
 
 function shuffle(deck) {
   const d = [...deck];
   for (let i = d.length - 1; i > 0; i -= 1) {
-    const j = Math.floor(Math.random() * (i + 1));
+    const j = randomInt(i + 1);
     [d[i], d[j]] = [d[j], d[i]];
   }
   return d;
@@ -335,11 +342,13 @@ function seatingRankValue(rank) {
 }
 
 function seatingSuitValue(suit) {
-  // The project already defines its deterministic natural-suit order as
-  // S, H, D, C. It is used only when two toss cards have the same rank so
-  // the server can produce one shared ordering without a client-side tie.
-  const index = SUITS.indexOf(suit);
-  return index < 0 ? 0 : SUITS.length - index;
+  return SEATING_SUIT_PRIORITY[String(suit || '').toUpperCase()] || 0;
+}
+
+function compareSeatingCardsHighToLow(leftCard, rightCard) {
+  const rankDiff = seatingRankValue(rightCard?.rank) - seatingRankValue(leftCard?.rank);
+  if (rankDiff) return rankDiff;
+  return seatingSuitValue(rightCard?.suit) - seatingSuitValue(leftCard?.suit);
 }
 
 function createSeatingDraw(players = []) {
@@ -353,11 +362,7 @@ function createSeatingDraw(players = []) {
     card: deck[index] || { id: `SEAT_${player.playerId}`, rank: '2', suit: 'C' },
   }));
 
-  picks.sort((a, b) => {
-    const rankDiff = seatingRankValue(b.card.rank) - seatingRankValue(a.card.rank);
-    if (rankDiff) return rankDiff;
-    return seatingSuitValue(b.card.suit) - seatingSuitValue(a.card.suit);
-  });
+  picks.sort((a, b) => compareSeatingCardsHighToLow(a.card, b.card));
   return picks.map(({ player, card }, rankOrder) => ({
     ...player,
     rankOrder,
@@ -503,6 +508,7 @@ function enumerateMelds(hand, wildJoker) {
 }
 
 function validateDeclaration(hand, wildJoker) {
+  if (!validTwoDeckCards(hand)) return { valid:false, reason:'Invalid physical card inventory' };
   return validate101Declaration(hand, wildJoker);
 }
 
@@ -617,7 +623,7 @@ function roundHistoryEntry(game, details = {}) {
         roundScore,
         previousScore: Math.max(0, totalScore - roundScore),
         totalScore,
-        status: player.playerId === winnerPlayerId
+        status: game.wrongShowPlayerIds?.has(player.playerId) ? 'WRONG SHOW' : player.playerId === winnerPlayerId
           ? 'ROUND WINNER'
           : isEliminated(game, player.playerId)
             ? 'ELIMINATED'
@@ -632,11 +638,15 @@ function roundHistoryEntry(game, details = {}) {
 
 function addPoints(game, playerId, points) {
   const safePoints = Math.max(0, Math.min(80, Number(points) || 0));
-  game.scoresByPlayerId[playerId] = (game.scoresByPlayerId[playerId] || 0) + safePoints;
-  game.roundPointsByPlayerId[playerId] = (game.roundPointsByPlayerId[playerId] || 0) + safePoints;
+  const previous = game.roundPointsByPlayerId[playerId] || 0;
+  const next = game.wrongShowPlayerIds?.has(playerId) ? 80 : Math.min(80, previous + safePoints);
+  game.scoresByPlayerId[playerId] = (game.scoresByPlayerId[playerId] || 0) + next - previous;
+  game.roundPointsByPlayerId[playerId] = next;
+  game.rejoinLocked ||= Object.values(game.scoresByPlayerId).some(score => score >= 80);
 }
 
 function dealRound(game, incrementRound = true) {
+  game.nextRoundAt = null;
   if (game.nextRoundTimer) {
     clearTimeout(game.nextRoundTimer);
     game.nextRoundTimer = null;
@@ -668,12 +678,14 @@ function dealRound(game, incrementRound = true) {
   game.deck = remaining;
   game.handsByPlayerId = handsByPlayerId;
   game.discardPile = firstDiscard ? [firstDiscard] : [];
+  game.initialOpenJokerAvailable = true;
   game.lastDiscardByPlayerId = {};
   // Per-player action history for the current round. This is public table
   // information: tapping a profile can show every card that player discarded.
   game.discardHistoryByPlayerId = Object.fromEntries(game.players.map((player) => [player.playerId, []]));
   game.wildJoker = wildJoker;
   game.droppedPlayerIds = new Set();
+  game.wrongShowPlayerIds = new Set();
   game.drawnPlayerIds = new Set();
   if (!game.lastRoundPointsByPlayerId) {
     game.lastRoundPointsByPlayerId = Object.fromEntries(game.players.map((player) => [player.playerId, 0]));
@@ -794,7 +806,7 @@ function bindPlayerSocket(code, player, socket) {
 
 function findGamePlayer(game, playerId, socketId) {
   return game?.players.find((p) =>
-    (playerId && p.playerId === playerId) || p.id === socketId
+    p.id === socketId && (!playerId || p.playerId === playerId)
   );
 }
 
@@ -823,6 +835,7 @@ function buildSnapshot(game, forPlayerId) {
     handSize: (game.handsByPlayerId[p.playerId] || []).length,
     score: game.scoresByPlayerId[p.playerId] || 0,
     roundPoints: game.roundPointsByPlayerId[p.playerId] || 0,
+    wrongShow: !!game.wrongShowPlayerIds?.has(p.playerId),
     lastRoundPoints: game.lastRoundPointsByPlayerId?.[p.playerId] || 0,
     lastDiscard: game.lastDiscardByPlayerId?.[p.playerId] || null,
     discardHistory: [...(game.discardHistoryByPlayerId?.[p.playerId] || [])],
@@ -837,6 +850,7 @@ function buildSnapshot(game, forPlayerId) {
     players: playerMeta,
     hand: game.handsByPlayerId[forPlayerId] || [],
     discardPile: game.discardPile,
+    initialOpenJokerAvailable: game.initialOpenJokerAvailable === true,
     deckSize: game.deck.length,
     wildJoker: game.wildJoker || null,
     turnIndex: game.turnIndex,
@@ -862,6 +876,8 @@ function buildSnapshot(game, forPlayerId) {
     requiredScorePlayerIds: scoreWindowRequiredPlayerIds(game),
     submittedScorePlayerIds: [...(game.submittedScorePlayerIds || new Set())],
     roundHistory: [...(game.roundHistory || [])],
+    rejoinLocked: !!game.rejoinLocked,
+    canFirstCardDeclare: canFirstCardDeclare(game, game.players.find(p => p.playerId === forPlayerId)),
     poolAmount: safePoolAmount(game),
     splitOffer: buildSplitOffer(game),
     splitFinalized: !!game.splitFinalized,
@@ -902,10 +918,12 @@ function buildRoundResult(code, game, forPlayerId, details = {}) {
     validDeclaration: details.validDeclaration ?? null,
     roundWinnerPlayerId: details.roundWinnerPlayerId || null,
     winnerPlayerId: game.winnerPlayerId || null,
-    nextRoundInSeconds: game.state === 'round_over' ? ROUND_RESULT_SECONDS : null,
+    nextRoundAt: game.nextRoundAt || null,
+    nextRoundInSeconds: game.state === 'round_over' ? Math.max(0, Math.ceil(((game.nextRoundAt || Date.now()) - Date.now()) / 1000)) : null,
     scoreWindowEndsAt: game.scoreWindowEndsAt || null,
     roundHistory: [...(game.roundHistory || [])],
     poolAmount: safePoolAmount(game),
+    rejoinLocked: !!game.rejoinLocked,
     splitOffer: buildSplitOffer(game),
     splitFinalized: !!game.splitFinalized,
     splitResult: game.splitResult || null,
@@ -932,6 +950,7 @@ function buildRoundResult(code, game, forPlayerId, details = {}) {
       roundPoints: game.roundPointsByPlayerId[player.playerId] || 0,
       lastRoundPoints: game.roundPointsByPlayerId[player.playerId] || 0,
       dropped: game.droppedPlayerIds.has(player.playerId),
+      wrongShow: !!game.wrongShowPlayerIds?.has(player.playerId),
       isEliminated: isEliminated(game, player.playerId),
       handSize: (game.handsByPlayerId[player.playerId] || []).length,
       lastDiscard: game.lastDiscardByPlayerId?.[player.playerId] || null,
@@ -942,7 +961,7 @@ function buildRoundResult(code, game, forPlayerId, details = {}) {
 
 function finishRound(code, details = {}) {
   const game = games[code];
-  if (!game) return;
+  if (!game || game.state === 'round_over' || game.state === 'finished') return;
 
   if (game.scoreWindowTimer) {
     clearTimeout(game.scoreWindowTimer);
@@ -971,6 +990,7 @@ function finishRound(code, details = {}) {
   }
 
   game.lastRoundDetails = { ...details };
+  game.nextRoundAt = game.state === 'round_over' ? Date.now() + ROUND_RESULT_SECONDS * 1000 : null;
   for (const player of game.players) {
     if (!player.connected || !player.id) continue;
     io.to(player.id).emit('round_result', buildRoundResult(code, game, player.playerId, details));
@@ -992,6 +1012,62 @@ function finishRound(code, details = {}) {
   }
 }
 
+function resumeAfterWrongShow(code, playerId, reason = 'wrong_declaration') {
+  const game = games[code];
+  if (!game || game.wrongShowPlayerIds?.has(playerId)) return { ok:false, message:'Wrong Show already recorded.' };
+  clearTimeout(game.scoreWindowTimer);
+  clearInterval(game.scoreWindowInterval);
+  game.scoreWindowTimer = null;
+  game.scoreWindowInterval = null;
+  game.wrongShowPlayerIds ||= new Set();
+  game.wrongShowPlayerIds.add(playerId);
+  addPoints(game, playerId, 80);
+  game.droppedPlayerIds.add(playerId);
+  game.declarationPlayerId = null;
+  game.declarationSubmitted = false;
+  game.scoreWindowStage = null;
+  game.scoreWindowEndsAt = null;
+  game.pendingRoundDetails = null;
+  game.pendingScoreSubmissions = {};
+  game.submittedScorePlayerIds = new Set();
+  game.roundWinnerPlayerId = null;
+  game.state = 'playing';
+  recordGameAction(game, { type:'wrong_show', playerId, penalty:80 });
+  io.to(code).emit('player_dropped', { code, playerId, penalty:80, reason });
+  const remaining = activeRoundPlayers(game);
+  if (remaining.length <= 1) {
+    finishRound(code, { reason:'last_player_after_wrong_show', roundWinnerPlayerId:remaining[0]?.playerId || null, message:'Round ended with one eligible player after Wrong Show.' });
+  } else {
+    const next = nextPlayableIndex(game, game.turnIndex);
+    if (next >= 0) game.turnIndex = next;
+    broadcastGameState(code);
+  }
+  return { ok:true, valid:false, penalty:80, scoreWindow:false, resumed:game.state === 'playing', reason:'WRONG SHOW', roundOver:game.state !== 'playing' };
+}
+
+function canFirstCardDeclare(game, actor) {
+  return !!game && !!actor && game.players.length === 6 && game.state === 'playing'
+    && game.players[game.turnIndex]?.playerId === actor.playerId && isRoundActive(game, actor)
+    && game.drawnPlayerIds.size === 0 && game.droppedPlayerIds.size === 0
+    && (game.handsByPlayerId[actor.playerId] || []).length === 13;
+}
+
+function declareInitialHand(code, actor) {
+  const game = games[code];
+  if (!canFirstCardDeclare(game, actor)) return { ok:false, message:'First-card declaration is only available before the first action at a six-player table.' };
+  const verdict = validateDeclaration(game.handsByPlayerId[actor.playerId], game.wildJoker);
+  if (!verdict.valid) return resumeAfterWrongShow(code, actor.playerId);
+  // No client scores or client card objects are accepted. Compute all results
+  // before applying any mutation so a validation failure cannot partly score.
+  const scores = game.players.filter(p => isRoundActive(game, p)).map(p => [p.playerId,
+    p.playerId === actor.playerId ? 0 : calculateFirstCardScore(game.handsByPlayerId[p.playerId], game.wildJoker).score]);
+  for (const [id, score] of scores) addPoints(game, id, score);
+  game.roundWinnerPlayerId = actor.playerId;
+  finishRound(code, { reason:'first_card_declaration', validDeclaration:true, declarerPlayerId:actor.playerId,
+    roundWinnerPlayerId:actor.playerId, message:`${actor.name} declared the initial 13 cards. Opponent scores capped at 40, less 4 per unmatched Joker.` });
+  return { ok:true, valid:true, roundOver:true };
+}
+
 function finalizeScoreWindow(code) {
   const game = games[code];
   if (!game || game.state !== 'score_window') return;
@@ -1007,17 +1083,7 @@ function finalizeScoreWindow(code) {
   // If the player placed a card in FINISH but never pressed DECLARE SHOW,
   // the 30-second declaration window expires as a wrong show.
   if (game.scoreWindowStage === 'declare' && game.declarationPlayerId && !game.declarationSubmitted) {
-    addPoints(game, game.declarationPlayerId, 80);
-    game.droppedPlayerIds.add(game.declarationPlayerId);
-    const declarer = game.players.find((player) => player.playerId === game.declarationPlayerId);
-    game.pendingRoundDetails = {
-      reason: 'declaration_timeout',
-      message: `${declarer?.name || 'Player'} did not submit the declaration within 30 seconds and received 80 points.`,
-      declarerPlayerId: game.declarationPlayerId,
-      validDeclaration: false,
-      roundWinnerPlayerId: null,
-    };
-    game.scoreWindowStage = 'score';
+    return resumeAfterWrongShow(code, game.declarationPlayerId, 'declaration_timeout');
   }
 
   const winnerId = game.roundWinnerPlayerId;
@@ -1174,17 +1240,7 @@ function submitDeclarationShow(code, actor) {
       roundWinnerPlayerId: actor.playerId,
     };
   } else {
-    addPoints(game, actor.playerId, 80);
-    game.droppedPlayerIds.add(actor.playerId);
-    game.roundWinnerPlayerId = null;
-    game.pendingRoundDetails = {
-      reason: 'wrong_declaration',
-      message: `${actor.name} made a wrong declaration and received 80 points. Scores finalize when the timer reaches 0.`,
-      declarerPlayerId: actor.playerId,
-      validDeclaration: false,
-      roundWinnerPlayerId: null,
-    };
-    io.to(code).emit('player_dropped', { code, playerId: actor.playerId, penalty: 80, reason: 'wrong_declaration' });
+    return resumeAfterWrongShow(code, actor.playerId);
   }
 
   emitDeclarationWindowState(code);
@@ -2059,7 +2115,7 @@ io.on('connection', (socket) => {
         return;
       }
       const openCard = game.discardPile[game.discardPile.length - 1];
-      if (ruleIsJokerCard(openCard, game.wildJoker)) {
+      if (ruleIsJokerCard(openCard, game.wildJoker) && game.initialOpenJokerAvailable !== true) {
         const response = { ok: false, message: 'Joker cannot be picked from the open deck. Draw from the closed deck.' };
         socket.emit('game_error', response);
         ack?.(response);
@@ -2089,6 +2145,7 @@ io.on('connection', (socket) => {
     }
 
     hand.push(card);
+    game.initialOpenJokerAvailable = false;
     game.drawnPlayerIds.add(actor.playerId);
     game.handsByPlayerId[actor.playerId] = hand;
     recordGameAction(game, {
@@ -2241,6 +2298,12 @@ io.on('connection', (socket) => {
   socket.on('begin_declare', handleBeginDeclaration);
   socket.on('declare', handleBeginDeclaration);
 
+  socket.on('first_card_declare', (payload = {}, ack) => {
+    const code = normaliseCode(payload.code);
+    const actor = findGamePlayer(games[code], String(payload.playerId || '').trim(), socket.id);
+    ack?.(declareInitialHand(code, actor));
+  });
+
   socket.on('confirm_declaration', (payload = {}, ack) => {
     const code = normaliseCode(payload.code);
     const playerId = String(payload.playerId || '').trim();
@@ -2349,6 +2412,11 @@ io.on('connection', (socket) => {
       return;
     }
 
+    // No participant can skip the completed scoreboard for the whole room.
+    if (game.nextRoundAt && Date.now() < game.nextRoundAt) {
+      ack?.({ ok:true, queued:true, code, roundNumber:game.roundNumber, nextRoundAt:game.nextRoundAt });
+      return;
+    }
     if (game.nextRoundTimer) {
       clearTimeout(game.nextRoundTimer);
       game.nextRoundTimer = null;
