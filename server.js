@@ -686,7 +686,7 @@ function safePoolAmount(game) {
 }
 
 function buildSplitOffer(game) {
-  const remaining = activeGamePlayers(game);
+  const remaining = eligibleRolePlayers(game);
   if (!SPLIT_COUNTS.has(remaining.length) || game.splitFinalized) return null;
   const poolAmount = safePoolAmount(game);
   if (poolAmount <= 0) return null;
@@ -2033,7 +2033,7 @@ function scheduleGameStart(code) {
 }
 
 app.get('/', (req, res) => {
-  res.json({ ok: true, service: 'Star Rummy multiplayer', version: '1.7.24', playScoreLimit: 80, rooms: Object.keys(rooms).length });
+  res.json({ ok: true, service: 'Star Rummy multiplayer', version: '1.7.26', playScoreLimit: 80, rooms: Object.keys(rooms).length });
 });
 
 io.on('connection', (socket) => {
