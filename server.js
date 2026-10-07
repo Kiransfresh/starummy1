@@ -2,11 +2,11 @@
 import express from 'express';
 import { createServer } from 'http';
 import { Server } from 'socket.io';
-import { randomInt } from 'node:crypto';
-import { calculateFirstCardScore, validTwoDeckCards } from './src/game/customPoolRules.js';
 
 
-// Core 101 rules plus shared custom first-card rules shipped in the Railway image.
+// Railway-safe 101-pool rules. These are intentionally embedded in the
+// socket server so the production backend does not depend on frontend src/
+// files being present in the Docker/GitHub build context.
 const RULE_HIGH_CARDS = new Set(['A', '10', 'J', 'Q', 'K']);
 
 function ruleIsPrintedJoker(card) {
@@ -34,6 +34,14 @@ function ruleIsWildJoker(card, wildJoker = null) {
 
 function ruleIsJokerCard(card, wildJoker = null) {
   return ruleIsPrintedJoker(card) || ruleIsWildJoker(card, wildJoker);
+}
+
+function canTakeInitialOpenJoker(game, playerId) {
+  const top = game.discardPile?.at(-1);
+  return game.state === 'playing' && game.initialOpenJokerAvailable === true
+    && game.drawnPlayerIds?.size === 0 && game.initialOpenJokerPlayerId === playerId
+    && game.players[game.turnIndex]?.playerId === playerId
+    && top?.id === game.initialOpenCardId;
 }
 
 function ruleCardPoints(card, wildJoker = null) {
@@ -236,6 +244,38 @@ function calculate101Penalty(hand, wildJoker = null) {
   );
   return Math.min(80, Math.max(0, totalPoints - protectedPoints));
 }
+
+// A valid show made before anyone draws is a special 101 Pool opening show.
+// Protect independently valid melds and score their unmatched cards normally.
+// Only a no-meld hand uses 40 minus half the wild rank's normal card value.
+function calculateFirstCardPenalty(hand, wildJoker = null) {
+  const cards = Array.isArray(hand) ? hand.filter(Boolean) : [];
+  if (!cards.length) return 0;
+  const melds = ruleEnumerateMelds(cards, wildJoker);
+  if (!melds.length) {
+    const jokers = cards.filter((card) => ruleIsJokerCard(card, wildJoker)).length;
+    const rank = String(ruleWildJokerRank(wildJoker) || 'A');
+    const value = RULE_HIGH_CARDS.has(rank) ? 10 : Number(rank) || 0;
+    return Math.max(0, 40 - value / 2 * jokers);
+  }
+  const byCard = ruleBuildMeldIndex(cards, melds);
+  const points = cards.map((card) => ruleCardPoints(card, wildJoker));
+  const memo = new Map();
+  function covered(mask) {
+    if (!mask) return 0;
+    if (memo.has(mask)) return memo.get(mask);
+    let first = 0;
+    while ((mask & (1 << first)) === 0) first += 1;
+    let best = covered(mask ^ (1 << first));
+    for (const meld of byCard[first]) {
+      if ((meld.mask & mask) === meld.mask) best = Math.max(best, meld.coveredPoints + covered(mask ^ meld.mask));
+    }
+    memo.set(mask, best);
+    return best;
+  }
+  const total = points.reduce((sum, point) => sum + point, 0);
+  return Math.min(80, Math.max(0, total - covered((1 << cards.length) - 1)));
+}
 const app = express();
 const httpServer = createServer(app);
 
@@ -287,9 +327,6 @@ const disconnectTimers = new Map();
 
 const SUITS = ['S', 'H', 'D', 'C'];
 const RANKS = ['A', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K'];
-// Official high-card toss tie-break used by this 101 Pool table. Card rank is
-// compared first; equal ranks are resolved by the suit shape shown on the card.
-const SEATING_SUIT_PRIORITY = Object.freeze({ S: 4, H: 3, D: 2, C: 1 });
 
 function normaliseCode(code) {
   return String(code || '').replace(/\D/g, '').slice(0, 4);
@@ -317,23 +354,21 @@ function buildDeck(offset = 0) {
 }
 
 function buildTwoDecks() {
-  const cards = [...buildDeck(0), ...buildDeck(100),
-    { id:'JKR_extra_0', rank:'JKR', suit:'JOKER', isJoker:true },
-    { id:'JKR_extra_1', rank:'JKR', suit:'JOKER', isJoker:true }];
-  if (!validTwoDeckCards(cards)) throw new Error('Invalid two-deck inventory');
-  return cards;
+  return [...buildDeck(0), ...buildDeck(100)];
 }
 
 function shuffle(deck) {
   const d = [...deck];
   for (let i = d.length - 1; i > 0; i -= 1) {
-    const j = randomInt(i + 1);
+    const j = Math.floor(Math.random() * (i + 1));
     [d[i], d[j]] = [d[j], d[i]];
   }
   return d;
 }
 
 function seatingRankValue(rank) {
+  rank = String(rank ?? '').trim().toUpperCase();
+  if (['JKR', 'JOKER', '🃏'].includes(rank)) return 15;
   if (rank === 'A') return 14;
   if (rank === 'K') return 13;
   if (rank === 'Q') return 12;
@@ -342,32 +377,34 @@ function seatingRankValue(rank) {
 }
 
 function seatingSuitValue(suit) {
-  return SEATING_SUIT_PRIORITY[String(suit || '').toUpperCase()] || 0;
-}
-
-function compareSeatingCardsHighToLow(leftCard, rightCard) {
-  const rankDiff = seatingRankValue(rightCard?.rank) - seatingRankValue(leftCard?.rank);
-  if (rankDiff) return rankDiff;
-  return seatingSuitValue(rightCard?.suit) - seatingSuitValue(leftCard?.suit);
+  // S, H, D, C: selection tie-break only, independent of hand grouping order.
+  const values = { S:4, '♠':4, H:3, '♥':3, D:2, '♦':2, C:1, '♣':1 };
+  return values[String(suit ?? '').trim().toUpperCase()] || 0;
 }
 
 function createSeatingDraw(players = []) {
-  // Exactly one card per real player is taken from one server-shuffled natural
-  // 52-card deck. Rank is A > K > ... > 2. Equal ranks use the project's
+  // Exactly one card per real player is taken from a server-shuffled selection
+  // natural 52-card selection deck. A > K > Q > J > ... > 2.
+  // Equal ranks use the project's
   // deterministic S > H > D > C order; no client performs randomness or
   // winner comparison, and no toss card is silently replaced before reveal.
-  const deck = shuffle(buildDeck(5000).filter((card) => RANKS.includes(card.rank)));
+  // Big Card selection ranks A through 2; game decks/jokers are untouched.
+  const deck = shuffle(buildDeck(5000).filter(card => !ruleIsPrintedJoker(card)));
   const picks = players.map((player, index) => ({
     player,
     card: deck[index] || { id: `SEAT_${player.playerId}`, rank: '2', suit: 'C' },
   }));
 
-  picks.sort((a, b) => compareSeatingCardsHighToLow(a.card, b.card));
+  picks.sort((a, b) => {
+    const rankDiff = seatingRankValue(b.card.rank) - seatingRankValue(a.card.rank);
+    if (rankDiff) return rankDiff;
+    return seatingSuitValue(b.card.suit) - seatingSuitValue(a.card.suit);
+  });
   return picks.map(({ player, card }, rankOrder) => ({
     ...player,
     rankOrder,
     seatIndex: null,
-    seatingCard: { id: card.id, rank: card.rank, suit: card.suit },
+    seatingCard: { id: card.id, rank: card.rank, suit: card.suit, isJoker: !!card.isJoker },
     hasCrown: rankOrder === 0,
   }));
 }
@@ -412,7 +449,7 @@ function finalizeAutomaticSeating(room) {
   room.pendingSeatingOrder = null;
   room.seatChoiceRequiredPlayerId = null;
   room.highCardPlayerId = seated[0]?.playerId || null;
-  room.initialDealerPlayerId = seated[0]?.playerId || null;
+  room.initialDealerPlayerId = seated.at(-1)?.playerId || null;
   return room.players;
 }
 
@@ -508,7 +545,6 @@ function enumerateMelds(hand, wildJoker) {
 }
 
 function validateDeclaration(hand, wildJoker) {
-  if (!validTwoDeckCards(hand)) return { valid:false, reason:'Invalid physical card inventory' };
   return validate101Declaration(hand, wildJoker);
 }
 
@@ -522,8 +558,17 @@ function isEliminated(game, playerId) {
 
 function isRoundActive(game, player) {
   return !!player
+    && player.isActive !== false && player.seatActive !== false
+    && !player.hasLeft && !player.removed && !player.permanentlyDisconnected
+    && (!Array.isArray(game.roundParticipantPlayerIds) || game.roundParticipantPlayerIds.includes(player.playerId))
     && !isEliminated(game, player.playerId)
-    && !game.droppedPlayerIds.has(player.playerId);
+    && !game.droppedPlayerIds.has(player.playerId)
+    && !(game.state === 'score_window' && game.scoreWindowStage === 'score'
+      && (game.declaredPlayerIds?.has(player.playerId) || game.submittedScorePlayerIds?.has(player.playerId)));
+}
+
+function acceptsTurnMoves(game) {
+  return game?.state === 'playing';
 }
 
 // Seat order is clockwise around the table. Moving +1 therefore moves to the
@@ -546,17 +591,36 @@ function activeGamePlayers(game) {
   return game.players.filter((player) => !isEliminated(game, player.playerId));
 }
 
-// Dealer/crown rotation follows the ORIGINAL seating-card ranking for the
-// whole session: highest card gets Round 1, next-lower card gets Round 2,
-// continuing until every active player has had the crown, then it loops.
+// Next-round participation is independent of 101-point elimination and of a
+// temporary network loss. A disconnected seat remains reserved for the
+// existing reconnect grace period; only a permanent exit removes eligibility.
+function eligibleRolePlayers(game) {
+  return (game.players || []).filter(player => player.playerId
+    && player.isActive !== false && player.seatActive !== false
+    && !player.hasLeft && !player.removed && !player.permanentlyDisconnected
+    && Number(game.scoresByPlayerId?.[player.playerId] ?? 0) < 80);
+}
+
+function rejoinCandidates(game) {
+  const survivors = activeGamePlayers(game);
+  if (!survivors.length || survivors.some((player) => (game.scoresByPlayerId[player.playerId] || 0) >= 80)) return [];
+  return game.players.filter((player) => isEliminated(game, player.playerId)).map((player) => player.playerId);
+}
+
+function rejoinStartingScore(game) {
+  return Math.max(...activeGamePlayers(game).map((player) => game.scoresByPlayerId[player.playerId] || 0), 0) + 1;
+}
+
+// Preserve the ORIGINAL next-lower card distributor rotation for the session.
+// The crown remains with its eligible owner; the distributor skips that seat.
 function dealerRotationOrder(game) {
   const configured = Array.isArray(game?.dealerRotationPlayerIds)
     ? game.dealerRotationPlayerIds.filter(Boolean)
     : [];
-  if (configured.length) return configured;
-  return [...(game?.players || [])]
+  const ranked = [...(game?.players || [])]
     .sort((a, b) => (a.rankOrder ?? 99) - (b.rankOrder ?? 99))
     .map((player) => player.playerId);
+  return configured.length ? [...configured, ...ranked.filter(id => !configured.includes(id))] : ranked;
 }
 
 function nextDealerIndexByTossRank(game, fromIndex) {
@@ -568,15 +632,51 @@ function nextDealerIndexByTossRank(game, fromIndex) {
     const playerId = order[(currentOrderIndex + offset + order.length) % order.length];
     const playerIndex = game.players.findIndex((player) => player.playerId === playerId);
     if (playerIndex < 0) continue;
-    const player = game.players[playerIndex];
-    if (!isEliminated(game, playerId) && player.connected !== false) return playerIndex;
+    const crownId = game.crownPlayerId || game.highCardPlayerId;
+    if (playerId !== crownId && eligibleRolePlayers(game).some(p => p.playerId === playerId)) return playerIndex;
   }
-  return Number.isInteger(fromIndex) ? fromIndex : -1;
+  return -1;
 }
 
-function syncDealerCrown(game) {
-  const dealerId = game?.players?.[game.dealerIndex]?.playerId || null;
-  for (const player of game?.players || []) player.hasCrown = !!dealerId && player.playerId === dealerId;
+// The single authoritative role flow for every real-player table size. Keep
+// an eligible crown, rotate the distributor by the existing next-lower card
+// order, and use points then original seat order only for required replacement.
+function calculateTableRoles(game, { initial = false, rotate = false } = {}) {
+  const eligible = eligibleRolePlayers(game);
+  const eligiblePlayerIds = eligible.map(player => player.playerId);
+  if (eligible.length < 2) return { crownPlayerId: null, distributorPlayerId: null, eligiblePlayerIds, reassigned: false };
+  const order = dealerRotationOrder(game);
+  const rankSorted = [...eligible].sort((a, b) => order.indexOf(a.playerId) - order.indexOf(b.playerId));
+  const pointSorted = [...eligible].sort((a, b) =>
+    Number(game.scoresByPlayerId?.[a.playerId] ?? 0) - Number(game.scoresByPlayerId?.[b.playerId] ?? 0)
+    || (a.seatIndex ?? game.players.indexOf(a)) - (b.seatIndex ?? game.players.indexOf(b)));
+  const previousCrown = game.crownPlayerId || game.highCardPlayerId || rankSorted[0].playerId;
+  const previousDistributor = game.distributorPlayerId || game.players[game.dealerIndex]?.playerId;
+  const crownValid = eligiblePlayerIds.includes(previousCrown);
+  const crownPlayerId = initial ? rankSorted[0].playerId : crownValid ? previousCrown : pointSorted[0].playerId;
+  const distributorValid = eligiblePlayerIds.includes(previousDistributor) && previousDistributor !== crownPlayerId;
+  let distributorPlayerId;
+  if (initial) distributorPlayerId = rankSorted.at(-1).playerId;
+  else if (!distributorValid) distributorPlayerId = pointSorted.find(player => player.playerId !== crownPlayerId).playerId;
+  else if (rotate) {
+    const index = nextDealerIndexByTossRank({ ...game, crownPlayerId }, game.players.findIndex(player => player.playerId === previousDistributor));
+    distributorPlayerId = game.players[index]?.playerId || previousDistributor;
+  } else distributorPlayerId = previousDistributor;
+  return { crownPlayerId, distributorPlayerId, eligiblePlayerIds, reassigned: !initial && (!crownValid || !distributorValid) };
+}
+
+function syncDealerCrown(game, options = {}) {
+  const roles = calculateTableRoles(game, options);
+  game.crownPlayerId = roles.crownPlayerId;
+  game.distributorPlayerId = roles.distributorPlayerId;
+  game.eligiblePlayerIds = roles.eligiblePlayerIds;
+  game.dealerIndex = game.players.findIndex(player => player.playerId === roles.distributorPlayerId);
+  if (roles.reassigned) game.rolesReassignedForNextRound = true;
+  for (const player of game.players) {
+    player.hasCrown = !!roles.crownPlayerId && player.playerId === roles.crownPlayerId;
+    player.hasDealer = !!roles.distributorPlayerId && player.playerId === roles.distributorPlayerId;
+  }
+  return roles;
 }
 
 function safePoolAmount(game) {
@@ -623,7 +723,7 @@ function roundHistoryEntry(game, details = {}) {
         roundScore,
         previousScore: Math.max(0, totalScore - roundScore),
         totalScore,
-        status: game.wrongShowPlayerIds?.has(player.playerId) ? 'WRONG SHOW' : player.playerId === winnerPlayerId
+        status: player.playerId === winnerPlayerId
           ? 'ROUND WINNER'
           : isEliminated(game, player.playerId)
             ? 'ELIMINATED'
@@ -638,15 +738,11 @@ function roundHistoryEntry(game, details = {}) {
 
 function addPoints(game, playerId, points) {
   const safePoints = Math.max(0, Math.min(80, Number(points) || 0));
-  const previous = game.roundPointsByPlayerId[playerId] || 0;
-  const next = game.wrongShowPlayerIds?.has(playerId) ? 80 : Math.min(80, previous + safePoints);
-  game.scoresByPlayerId[playerId] = (game.scoresByPlayerId[playerId] || 0) + next - previous;
-  game.roundPointsByPlayerId[playerId] = next;
-  game.rejoinLocked ||= Object.values(game.scoresByPlayerId).some(score => score >= 80);
+  game.scoresByPlayerId[playerId] = (game.scoresByPlayerId[playerId] || 0) + safePoints;
+  game.roundPointsByPlayerId[playerId] = (game.roundPointsByPlayerId[playerId] || 0) + safePoints;
 }
 
 function dealRound(game, incrementRound = true) {
-  game.nextRoundAt = null;
   if (game.nextRoundTimer) {
     clearTimeout(game.nextRoundTimer);
     game.nextRoundTimer = null;
@@ -655,9 +751,18 @@ function dealRound(game, incrementRound = true) {
     clearTimeout(game.scoreWindowTimer);
     game.scoreWindowTimer = null;
   }
+  const previousRoundNumber = game.roundNumber || 0;
+  syncDealerCrown(game, { initial: previousRoundNumber === 0, rotate: previousRoundNumber > 0 && !game.rolesReassignedForNextRound });
+  game.rolesReassignedForNextRound = false;
+  game.roundParticipantPlayerIds = [...game.eligiblePlayerIds];
+  if (game.roundParticipantPlayerIds.length < 2) {
+    game.state = 'finished';
+    game.winnerPlayerId = game.roundParticipantPlayerIds[0] || game.roundWinnerPlayerId || null;
+    return;
+  }
   const deck = shuffle(buildTwoDecks());
   const handsByPlayerId = Object.fromEntries(game.players.map((player) => [player.playerId, []]));
-  const activePlayers = game.players.filter((player) => !isEliminated(game, player.playerId));
+  const activePlayers = game.players.filter(player => game.roundParticipantPlayerIds.includes(player.playerId));
   let cursor = 0;
 
   // Real-table style distribution: one card per active seat per pass instead
@@ -678,46 +783,42 @@ function dealRound(game, incrementRound = true) {
   game.deck = remaining;
   game.handsByPlayerId = handsByPlayerId;
   game.discardPile = firstDiscard ? [firstDiscard] : [];
-  game.initialOpenJokerAvailable = true;
   game.lastDiscardByPlayerId = {};
   // Per-player action history for the current round. This is public table
   // information: tapping a profile can show every card that player discarded.
   game.discardHistoryByPlayerId = Object.fromEntries(game.players.map((player) => [player.playerId, []]));
   game.wildJoker = wildJoker;
   game.droppedPlayerIds = new Set();
-  game.wrongShowPlayerIds = new Set();
   game.drawnPlayerIds = new Set();
   if (!game.lastRoundPointsByPlayerId) {
     game.lastRoundPointsByPlayerId = Object.fromEntries(game.players.map((player) => [player.playerId, 0]));
   }
   game.roundPointsByPlayerId = Object.fromEntries(game.players.map((player) => [player.playerId, 0]));
-  const previousRoundNumber = game.roundNumber || 0;
   game.roundNumber = incrementRound ? previousRoundNumber + 1 : (previousRoundNumber || 1);
   game.state = 'playing';
   game.winnerPlayerId = null;
   game.roundWinnerPlayerId = null;
   game.declarationPlayerId = null;
   game.declarationSubmitted = false;
+  game.firstCardDeclaration = false;
   game.scoreWindowStage = null;
   game.scoreWindowEndsAt = null;
   game.pendingScoreSubmissions = {};
   game.submittedScorePlayerIds = new Set();
+  game.declaredPlayerIds = new Set();
+  game.rejoinCandidatePlayerIds = [];
+  game.rejoinEndsAt = null;
   game.splitConfirmedPlayerIds = new Set();
   game.lastRoundDetails = null;
 
-  // First deal belongs to the HIGHEST seating-card player (crown). Later
-  // rounds follow that same original toss ranking: next-lower card, then the
-  // next-lower card, until all active players have had the crown, then loop.
-  if (previousRoundNumber === 0 && Number.isInteger(game.initialDealerIndex)) {
-    game.dealerIndex = game.initialDealerIndex;
-  } else if (previousRoundNumber > 0) {
-    const nextDealer = nextDealerIndexByTossRank(game, Number.isInteger(game.dealerIndex) ? game.dealerIndex : -1);
-    if (nextDealer >= 0) game.dealerIndex = nextDealer;
-  }
-  syncDealerCrown(game);
+  // Roles above determine WHO deals; the existing dealing/turn implementation
+  // is otherwise unchanged, including the first turn on the dealer's right.
   // The first turn still begins with the active player on the dealer's right.
   const firstTurn = nextPlayableIndex(game, Number.isInteger(game.dealerIndex) ? game.dealerIndex : -1);
   game.turnIndex = firstTurn >= 0 ? firstTurn : (game.dealerIndex >= 0 ? game.dealerIndex : 0);
+  game.initialOpenJokerAvailable = true;
+  game.initialOpenJokerPlayerId = game.players[game.turnIndex]?.playerId || null;
+  game.initialOpenCardId = firstDiscard?.id ?? null;
 }
 
 function publicPlayers(players) {
@@ -730,6 +831,7 @@ function publicPlayers(players) {
     rankOrder: p.rankOrder ?? null,
     seatingCard: p.seatingCard || null,
     hasCrown: !!p.hasCrown,
+    hasDealer: !!p.hasDealer,
   }));
 }
 
@@ -752,6 +854,7 @@ function recordGameAction(game, action) {
 function emitRoomUpdate(code) {
   const room = rooms[code];
   if (!room) return;
+  const game = games[code];
   const phase = room.startSequence?.phase || null;
   const revealCards = ['revealed', 'highest', 'seat_order', 'dealer', 'cleanup', 'initial_deal', 'complete'].includes(phase);
   const revealHigh = ['highest', 'seat_order', 'dealer', 'cleanup', 'initial_deal', 'complete'].includes(phase);
@@ -769,10 +872,19 @@ function emitRoomUpdate(code) {
     tableSize: normaliseTableSize(room.tableSize),
     minPlayers: normaliseMinPlayers(room.minPlayers, room.tableSize),
     highCardPlayerId: revealHigh ? (room.highCardPlayerId || null) : null,
-    dealerPlayerId: revealDealer ? (room.initialDealerPlayerId || null) : null,
+    dealerPlayerId: game ? game.distributorPlayerId || null : revealDealer ? (room.initialDealerPlayerId || null) : null,
+    ...(game ? {
+      crownPlayerId: game.crownPlayerId || null,
+      distributorPlayerId: game.distributorPlayerId || null,
+      eligiblePlayerIds: [...(game.eligiblePlayerIds || [])],
+    } : {}),
     seatChoiceRequiredPlayerId: null,
     seatingDraw: publicDraw.length ? publicDraw : (room.pendingSeatingOrder ? [] : seatingDrawPayload(room.players)),
-    players: publicPlayers(room.players),
+    players: publicPlayers(room.players).map(player => game ? {
+      ...player,
+      hasCrown: player.playerId === game.crownPlayerId,
+      hasDealer: player.playerId === game.distributorPlayerId,
+    } : player),
   });
 }
 
@@ -788,7 +900,7 @@ function clearDisconnectTimer(code, playerId) {
 }
 
 function bindPlayerSocket(code, player, socket) {
-  if (!player) return;
+  if (!player || player.hasLeft || player.isActive === false) return;
   clearDisconnectTimer(code, player.playerId);
   player.id = socket.id;
   player.connected = true;
@@ -806,7 +918,7 @@ function bindPlayerSocket(code, player, socket) {
 
 function findGamePlayer(game, playerId, socketId) {
   return game?.players.find((p) =>
-    p.id === socketId && (!playerId || p.playerId === playerId)
+    (playerId && p.playerId === playerId) || p.id === socketId
   );
 }
 
@@ -817,6 +929,7 @@ function scoreWindowRequiredPlayerIds(game) {
   }
   return game.players
     .filter((player) => player.playerId !== game.roundWinnerPlayerId)
+    .filter((player) => !game.declaredPlayerIds?.has(player.playerId))
     .filter((player) => !game.droppedPlayerIds.has(player.playerId))
     .filter((player) => !isEliminated(game, player.playerId))
     .map((player) => player.playerId);
@@ -832,10 +945,11 @@ function buildSnapshot(game, forPlayerId) {
     rankOrder: p.rankOrder ?? null,
     seatingCard: p.seatingCard || null,
     hasCrown: !!p.hasCrown,
+    hasDealer: !!p.hasDealer,
+    roundEligible: !Array.isArray(game.roundParticipantPlayerIds) || game.roundParticipantPlayerIds.includes(p.playerId),
     handSize: (game.handsByPlayerId[p.playerId] || []).length,
     score: game.scoresByPlayerId[p.playerId] || 0,
     roundPoints: game.roundPointsByPlayerId[p.playerId] || 0,
-    wrongShow: !!game.wrongShowPlayerIds?.has(p.playerId),
     lastRoundPoints: game.lastRoundPointsByPlayerId?.[p.playerId] || 0,
     lastDiscard: game.lastDiscardByPlayerId?.[p.playerId] || null,
     discardHistory: [...(game.discardHistoryByPlayerId?.[p.playerId] || [])],
@@ -844,13 +958,13 @@ function buildSnapshot(game, forPlayerId) {
     scoreSubmitted: game.submittedScorePlayerIds?.has(p.playerId) || false,
   }));
 
-  const current = game.state === 'playing' ? (game.players[game.turnIndex] || null) : null;
+  const turnPlayer = game.players[game.turnIndex] || null;
+  const current = acceptsTurnMoves(game) && isRoundActive(game, turnPlayer) ? turnPlayer : null;
 
   return {
     players: playerMeta,
     hand: game.handsByPlayerId[forPlayerId] || [],
     discardPile: game.discardPile,
-    initialOpenJokerAvailable: game.initialOpenJokerAvailable === true,
     deckSize: game.deck.length,
     wildJoker: game.wildJoker || null,
     turnIndex: game.turnIndex,
@@ -860,6 +974,10 @@ function buildSnapshot(game, forPlayerId) {
     roundNumber: game.roundNumber || 1,
     dealerIndex: game.dealerIndex ?? 0,
     dealerPlayerId: game.players[game.dealerIndex]?.playerId || null,
+    crownPlayerId: game.crownPlayerId || null,
+    distributorPlayerId: game.distributorPlayerId || null,
+    eligiblePlayerIds: [...(game.eligiblePlayerIds || [])],
+    roundParticipantPlayerIds: [...(game.roundParticipantPlayerIds || game.eligiblePlayerIds || [])],
     highCardPlayerId: game.highCardPlayerId || null,
     seatingDraw: game.seatingDraw || [],
     winnerPlayerId: game.winnerPlayerId || null,
@@ -875,9 +993,13 @@ function buildSnapshot(game, forPlayerId) {
     scoreWindowSecondsRemaining: game.scoreWindowEndsAt ? Math.max(0, Math.ceil((game.scoreWindowEndsAt - Date.now()) / 1000)) : null,
     requiredScorePlayerIds: scoreWindowRequiredPlayerIds(game),
     submittedScorePlayerIds: [...(game.submittedScorePlayerIds || new Set())],
+    declaredPlayerIds: [...(game.declaredPlayerIds || new Set())],
+    firstCardDeclarationAvailable: game.state === 'playing' && game.drawnPlayerIds?.size === 0,
+    canPickInitialOpenJoker: canTakeInitialOpenJoker(game, forPlayerId),
+    rejoinCandidatePlayerIds: game.state === 'round_over' ? [...(game.rejoinCandidatePlayerIds || [])] : [],
+    rejoinStartingScore: game.state === 'round_over' && game.rejoinCandidatePlayerIds?.length ? rejoinStartingScore(game) : null,
+    rejoinEndsAt: game.rejoinEndsAt || null,
     roundHistory: [...(game.roundHistory || [])],
-    rejoinLocked: !!game.rejoinLocked,
-    canFirstCardDeclare: canFirstCardDeclare(game, game.players.find(p => p.playerId === forPlayerId)),
     poolAmount: safePoolAmount(game),
     splitOffer: buildSplitOffer(game),
     splitFinalized: !!game.splitFinalized,
@@ -910,6 +1032,9 @@ function broadcastGameState(code) {
 function buildRoundResult(code, game, forPlayerId, details = {}) {
   return {
     code,
+    crownPlayerId: game.crownPlayerId || null,
+    distributorPlayerId: game.distributorPlayerId || null,
+    eligiblePlayerIds: [...(game.eligiblePlayerIds || [])],
     roundNumber: game.roundNumber || 1,
     state: game.state,
     reason: details.reason || 'round_over',
@@ -918,12 +1043,14 @@ function buildRoundResult(code, game, forPlayerId, details = {}) {
     validDeclaration: details.validDeclaration ?? null,
     roundWinnerPlayerId: details.roundWinnerPlayerId || null,
     winnerPlayerId: game.winnerPlayerId || null,
-    nextRoundAt: game.nextRoundAt || null,
-    nextRoundInSeconds: game.state === 'round_over' ? Math.max(0, Math.ceil(((game.nextRoundAt || Date.now()) - Date.now()) / 1000)) : null,
+    nextRoundInSeconds: game.state === 'round_over' ? ROUND_RESULT_SECONDS : null,
+    rejoinCandidatePlayerIds: [...(game.rejoinCandidatePlayerIds || [])],
+    rejoinStartingScore: game.rejoinCandidatePlayerIds?.length ? rejoinStartingScore(game) : null,
+    rejoinEndsAt: game.rejoinEndsAt || null,
+    declaredPlayerIds: [...(game.declaredPlayerIds || new Set())],
     scoreWindowEndsAt: game.scoreWindowEndsAt || null,
     roundHistory: [...(game.roundHistory || [])],
     poolAmount: safePoolAmount(game),
-    rejoinLocked: !!game.rejoinLocked,
     splitOffer: buildSplitOffer(game),
     splitFinalized: !!game.splitFinalized,
     splitResult: game.splitResult || null,
@@ -946,11 +1073,11 @@ function buildRoundResult(code, game, forPlayerId, details = {}) {
       rankOrder: player.rankOrder ?? null,
       seatingCard: player.seatingCard || null,
       hasCrown: !!player.hasCrown,
+      hasDealer: !!player.hasDealer,
       score: game.scoresByPlayerId[player.playerId] || 0,
       roundPoints: game.roundPointsByPlayerId[player.playerId] || 0,
       lastRoundPoints: game.roundPointsByPlayerId[player.playerId] || 0,
       dropped: game.droppedPlayerIds.has(player.playerId),
-      wrongShow: !!game.wrongShowPlayerIds?.has(player.playerId),
       isEliminated: isEliminated(game, player.playerId),
       handSize: (game.handsByPlayerId[player.playerId] || []).length,
       lastDiscard: game.lastDiscardByPlayerId?.[player.playerId] || null,
@@ -961,7 +1088,7 @@ function buildRoundResult(code, game, forPlayerId, details = {}) {
 
 function finishRound(code, details = {}) {
   const game = games[code];
-  if (!game || game.state === 'round_over' || game.state === 'finished') return;
+  if (!game) return;
 
   if (game.scoreWindowTimer) {
     clearTimeout(game.scoreWindowTimer);
@@ -980,17 +1107,22 @@ function finishRound(code, details = {}) {
   game.roundHistory = game.roundHistory || [];
   game.roundHistory.push(roundHistoryEntry(game, details));
 
-  const remaining = activeGamePlayers(game);
+  const remaining = eligibleRolePlayers(game);
+  game.rejoinCandidatePlayerIds = rejoinCandidates(game);
+  game.rejoinEndsAt = game.rejoinCandidatePlayerIds.length ? Date.now() + ROUND_RESULT_SECONDS * 1000 : null;
   if (remaining.length <= 1) {
     game.state = 'finished';
     game.winnerPlayerId = remaining[0]?.playerId || game.roundWinnerPlayerId || null;
+    game.rejoinCandidatePlayerIds = [];
+    game.rejoinEndsAt = null;
+    if (rooms[code]) rooms[code].gameStartScheduled = false;
   } else {
     game.state = 'round_over';
     game.winnerPlayerId = null;
   }
 
+  syncDealerCrown(game);
   game.lastRoundDetails = { ...details };
-  game.nextRoundAt = game.state === 'round_over' ? Date.now() + ROUND_RESULT_SECONDS * 1000 : null;
   for (const player of game.players) {
     if (!player.connected || !player.id) continue;
     io.to(player.id).emit('round_result', buildRoundResult(code, game, player.playerId, details));
@@ -1005,6 +1137,15 @@ function finishRound(code, details = {}) {
     game.nextRoundTimer = setTimeout(() => {
       const current = games[code];
       if (!current || current.state !== 'round_over' || current.splitFinalized) return;
+      current.rejoinCandidatePlayerIds = [];
+      current.rejoinEndsAt = null;
+      if (eligibleRolePlayers(current).length <= 1) {
+        current.state = 'finished';
+        current.winnerPlayerId = eligibleRolePlayers(current)[0]?.playerId || current.roundWinnerPlayerId || null;
+        syncDealerCrown(current);
+        broadcastGameState(code);
+        return;
+      }
       dealRound(current);
       io.to(code).emit('round_started', { code, roundNumber: current.roundNumber });
       broadcastGameState(code);
@@ -1012,65 +1153,42 @@ function finishRound(code, details = {}) {
   }
 }
 
-function resumeAfterWrongShow(code, playerId, reason = 'wrong_declaration') {
+function resumeAfterWrongShow(code, playerId, reason) {
   const game = games[code];
-  if (!game || game.wrongShowPlayerIds?.has(playerId)) return { ok:false, message:'Wrong Show already recorded.' };
-  clearTimeout(game.scoreWindowTimer);
-  clearInterval(game.scoreWindowInterval);
+  if (!game) return;
+  if (game.scoreWindowTimer) clearTimeout(game.scoreWindowTimer);
+  if (game.scoreWindowInterval) clearInterval(game.scoreWindowInterval);
   game.scoreWindowTimer = null;
   game.scoreWindowInterval = null;
-  game.wrongShowPlayerIds ||= new Set();
-  game.wrongShowPlayerIds.add(playerId);
-  addPoints(game, playerId, 80);
-  game.droppedPlayerIds.add(playerId);
+  game.scoreWindowEndsAt = null;
+  game.scoreWindowStage = null;
   game.declarationPlayerId = null;
   game.declarationSubmitted = false;
-  game.scoreWindowStage = null;
-  game.scoreWindowEndsAt = null;
+  game.roundWinnerPlayerId = null;
   game.pendingRoundDetails = null;
   game.pendingScoreSubmissions = {};
   game.submittedScorePlayerIds = new Set();
-  game.roundWinnerPlayerId = null;
   game.state = 'playing';
-  recordGameAction(game, { type:'wrong_show', playerId, penalty:80 });
-  io.to(code).emit('player_dropped', { code, playerId, penalty:80, reason });
+  addPoints(game, playerId, 80);
+  game.droppedPlayerIds.add(playerId);
+  io.to(code).emit('player_dropped', { code, playerId, penalty: 80, reason });
   const remaining = activeRoundPlayers(game);
   if (remaining.length <= 1) {
-    finishRound(code, { reason:'last_player_after_wrong_show', roundWinnerPlayerId:remaining[0]?.playerId || null, message:'Round ended with one eligible player after Wrong Show.' });
-  } else {
-    const next = nextPlayableIndex(game, game.turnIndex);
-    if (next >= 0) game.turnIndex = next;
-    broadcastGameState(code);
+    finishRound(code, { reason, roundWinnerPlayerId: remaining[0]?.playerId || null,
+      message: 'Wrong show: 80 points. No other active player remains.' });
+    return;
   }
-  return { ok:true, valid:false, penalty:80, scoreWindow:false, resumed:game.state === 'playing', reason:'WRONG SHOW', roundOver:game.state !== 'playing' };
-}
-
-function canFirstCardDeclare(game, actor) {
-  return !!game && !!actor && game.players.length === 6 && game.state === 'playing'
-    && game.players[game.turnIndex]?.playerId === actor.playerId && isRoundActive(game, actor)
-    && game.drawnPlayerIds.size === 0 && game.droppedPlayerIds.size === 0
-    && (game.handsByPlayerId[actor.playerId] || []).length === 13;
-}
-
-function declareInitialHand(code, actor) {
-  const game = games[code];
-  if (!canFirstCardDeclare(game, actor)) return { ok:false, message:'First-card declaration is only available before the first action at a six-player table.' };
-  const verdict = validateDeclaration(game.handsByPlayerId[actor.playerId], game.wildJoker);
-  if (!verdict.valid) return resumeAfterWrongShow(code, actor.playerId);
-  // No client scores or client card objects are accepted. Compute all results
-  // before applying any mutation so a validation failure cannot partly score.
-  const scores = game.players.filter(p => isRoundActive(game, p)).map(p => [p.playerId,
-    p.playerId === actor.playerId ? 0 : calculateFirstCardScore(game.handsByPlayerId[p.playerId], game.wildJoker).score]);
-  for (const [id, score] of scores) addPoints(game, id, score);
-  game.roundWinnerPlayerId = actor.playerId;
-  finishRound(code, { reason:'first_card_declaration', validDeclaration:true, declarerPlayerId:actor.playerId,
-    roundWinnerPlayerId:actor.playerId, message:`${actor.name} declared the initial 13 cards. Opponent scores capped at 40, less 4 per unmatched Joker.` });
-  return { ok:true, valid:true, roundOver:true };
+  const nextIndex = nextPlayableIndex(game, game.turnIndex);
+  game.initialOpenJokerAvailable = false;
+  if (nextIndex >= 0) game.turnIndex = nextIndex;
+  broadcastGameState(code);
 }
 
 function finalizeScoreWindow(code) {
   const game = games[code];
   if (!game || game.state !== 'score_window') return;
+  // The shared declaration deadline is authoritative, even if everyone shows early.
+  if (game.scoreWindowStage === 'score' && Date.now() < game.scoreWindowEndsAt) return;
   if (game.scoreWindowTimer) {
     clearTimeout(game.scoreWindowTimer);
     game.scoreWindowTimer = null;
@@ -1083,18 +1201,20 @@ function finalizeScoreWindow(code) {
   // If the player placed a card in FINISH but never pressed DECLARE SHOW,
   // the 30-second declaration window expires as a wrong show.
   if (game.scoreWindowStage === 'declare' && game.declarationPlayerId && !game.declarationSubmitted) {
-    return resumeAfterWrongShow(code, game.declarationPlayerId, 'declaration_timeout');
+    resumeAfterWrongShow(code, game.declarationPlayerId, 'declaration_timeout');
+    return;
   }
 
   const winnerId = game.roundWinnerPlayerId;
   for (const player of game.players) {
-    if (player.playerId === winnerId) continue;
+    if (player.playerId === winnerId || game.declaredPlayerIds?.has(player.playerId)) continue;
     if (game.droppedPlayerIds.has(player.playerId)) continue; // drop/wrong-show penalty already recorded
     if (isEliminated(game, player.playerId)) continue;
     const submitted = game.pendingScoreSubmissions?.[player.playerId];
     const score = Number.isFinite(submitted)
       ? submitted
-      : calculateDeadwood(game.handsByPlayerId[player.playerId] || [], game.wildJoker);
+      : game.firstCardDeclaration ? calculateFirstCardPenalty(game.handsByPlayerId[player.playerId] || [], game.wildJoker)
+        : calculateDeadwood(game.handsByPlayerId[player.playerId] || [], game.wildJoker);
     addPoints(game, player.playerId, score);
   }
 
@@ -1124,22 +1244,99 @@ function emitDeclarationWindowState(code) {
     seconds,
     requiredPlayerIds: scoreWindowRequiredPlayerIds(game),
     submittedPlayerIds: [...(game.submittedScorePlayerIds || new Set())],
+    declaredPlayerIds: [...(game.declaredPlayerIds || new Set())],
     message: game.scoreWindowStage === 'declare'
       ? 'Finish confirmed. Arrange your 13 cards and press DECLARE SHOW before the 30-second timer reaches 0.'
-      : 'Declaration submitted. Other players may group their cards and commit before the timer reaches 0.',
+      : 'Declare only: pick, discard and drop are locked. Final scores appear after 30 seconds.',
   });
+}
+
+function advanceScoreWindowTurn(code, fromIndex = null) {
+  const game = games[code];
+  if (!game || game.state !== 'score_window' || game.scoreWindowStage !== 'score') return;
+  // No turn exists during the declaration-only window. Never end it early.
+  game.turnIndex = -1;
+  broadcastGameState(code);
+}
+
+function submitFollowingDeclaration(code, actor, cardId) {
+  const game = games[code];
+  const hand = game.handsByPlayerId[actor.playerId] || [];
+  if (hand.length !== 13 || cardId) {
+    return { ok: false, message: 'Declare your existing 13 cards. No picking or discarding is allowed.' };
+  }
+  const verdict = validateDeclaration(hand, game.wildJoker);
+  game.submittedScorePlayerIds.add(actor.playerId);
+  if (verdict.valid) {
+    game.declaredPlayerIds.add(actor.playerId);
+    game.pendingScoreSubmissions[actor.playerId] = 0;
+  } else {
+    addPoints(game, actor.playerId, 80);
+    game.droppedPlayerIds.add(actor.playerId);
+    io.to(code).emit('player_dropped', { code, playerId: actor.playerId, penalty: 80, reason: 'wrong_declaration' });
+  }
+  io.to(code).emit('player_declared', { code, roundNumber: game.roundNumber, playerId: actor.playerId,
+    valid: verdict.valid, reason: verdict.reason, winnerPlayerId: game.roundWinnerPlayerId,
+    scoreWindowEndsAt: game.scoreWindowEndsAt });
+  const response = {
+    ok: true, valid: verdict.valid, wrongShow: !verdict.valid, penalty: verdict.valid ? 0 : 80,
+    reason: verdict.reason, scoreWindow: true, stage: 'score', submitted: true,
+    scoreWindowEndsAt: game.scoreWindowEndsAt, winnerPlayerId: game.roundWinnerPlayerId,
+  };
+  // Subsequent shows keep the first winner and the original fixed deadline.
+  // A wrong show penalizes this player only and never cancels that window.
+  advanceScoreWindowTurn(code, game.turnIndex);
+  response.roundOver = game.state !== 'score_window';
+  response.state = game.state;
+  return response;
 }
 
 function beginDeclarationWindow(code, actor, cardId) {
   const game = games[code];
   if (!game || !actor) return { ok: false, message: 'No active round was found.' };
-  if (game.state !== 'playing') return { ok: false, message: 'The round is not accepting a finish right now.' };
+  if (game.state === 'score_window' && game.scoreWindowStage === 'score') {
+    if (!game.scoreWindowEndsAt || Date.now() >= game.scoreWindowEndsAt) {
+      return { ok: false, message: 'The 30-second declaration window has expired.' };
+    }
+    if (!isRoundActive(game, actor)) return { ok: false, message: 'Your declaration or penalty is already locked.' };
+    return submitFollowingDeclaration(code, actor, cardId);
+  }
+  if (!acceptsTurnMoves(game)) return { ok: false, message: 'The round is not accepting a finish right now.' };
   const currentPlayer = game.players[game.turnIndex];
   if (!currentPlayer || actor.playerId !== currentPlayer.playerId || !isRoundActive(game, actor)) {
     return { ok: false, message: 'You can only finish on your turn.' };
   }
 
   const hand = game.handsByPlayerId[actor.playerId] || [];
+  if (hand.length === 13 && !cardId && game.drawnPlayerIds.size === 0) {
+    const verdict = validateDeclaration(hand, game.wildJoker);
+    if (!verdict.valid) return { ok: false, message: `Initial 13 cards are not a valid declaration: ${verdict.reason}` };
+    game.state = 'score_window';
+    game.scoreWindowStage = 'score';
+    game.firstCardDeclaration = true;
+    game.declarationPlayerId = actor.playerId;
+    game.declarationSubmitted = true;
+    game.roundWinnerPlayerId = actor.playerId;
+    game.pendingScoreSubmissions = {};
+    game.submittedScorePlayerIds = new Set([actor.playerId]);
+    game.declaredPlayerIds = new Set([actor.playerId]);
+    game.declaredPlayerIds.add(actor.playerId);
+    game.pendingRoundDetails = {
+      reason: 'first_card_declaration',
+      message: `${actor.name} declared with the initial 13 cards. Remaining players have 30 seconds to declare.`,
+      declarerPlayerId: actor.playerId,
+      roundWinnerPlayerId: actor.playerId,
+      validDeclaration: true,
+    };
+    game.scoreWindowEndsAt = Date.now() + SCORE_WINDOW_SECONDS * 1000;
+    if (game.scoreWindowTimer) clearTimeout(game.scoreWindowTimer);
+    if (game.scoreWindowInterval) clearInterval(game.scoreWindowInterval);
+    game.scoreWindowTimer = setTimeout(() => finalizeScoreWindow(code), SCORE_WINDOW_SECONDS * 1000);
+    game.scoreWindowInterval = setInterval(() => emitDeclarationWindowState(code), 1000);
+    emitDeclarationWindowState(code);
+    advanceScoreWindowTurn(code, game.turnIndex);
+    return { ok: true, firstCardDeclaration: true, roundOver: game.state !== 'score_window', valid: true, stage:'score', scoreWindow:true, scoreWindowEndsAt:game.scoreWindowEndsAt, winnerPlayerId:actor.playerId };
+  }
   if (hand.length !== 14) return { ok: false, message: 'Draw a card before using Finish.' };
   const discardIndex = hand.findIndex((card) => card.id === cardId);
   if (discardIndex < 0) return { ok: false, message: 'Select a card from your hand for the finish slot.' };
@@ -1156,6 +1353,9 @@ function beginDeclarationWindow(code, actor, cardId) {
   game.pendingRoundDetails = null;
   game.pendingScoreSubmissions = {};
   game.submittedScorePlayerIds = new Set();
+  game.declaredPlayerIds = new Set();
+  game.rejoinCandidatePlayerIds = [];
+  game.rejoinEndsAt = null;
   game.scoreWindowEndsAt = Date.now() + SCORE_WINDOW_SECONDS * 1000;
 
   if (game.nextRoundTimer) {
@@ -1182,6 +1382,7 @@ function beginDeclarationWindow(code, actor, cardId) {
       seconds,
       requiredPlayerIds: scoreWindowRequiredPlayerIds(current),
       submittedPlayerIds: [...(current.submittedScorePlayerIds || new Set())],
+      declaredPlayerIds: [...(current.declaredPlayerIds || new Set())],
     });
     if (seconds <= 0 && current.scoreWindowInterval) {
       clearInterval(current.scoreWindowInterval);
@@ -1225,6 +1426,7 @@ function submitDeclarationShow(code, actor) {
 
   io.to(code).emit('player_declared', {
     code,
+    roundNumber: game.roundNumber,
     playerId: actor.playerId,
     valid: verdict.valid,
     reason: verdict.reason,
@@ -1232,6 +1434,10 @@ function submitDeclarationShow(code, actor) {
 
   if (verdict.valid) {
     game.roundWinnerPlayerId = actor.playerId;
+    game.declaredPlayerIds.add(actor.playerId);
+    game.scoreWindowEndsAt = Date.now() + SCORE_WINDOW_SECONDS * 1000;
+    if (game.scoreWindowTimer) clearTimeout(game.scoreWindowTimer);
+    game.scoreWindowTimer = setTimeout(() => finalizeScoreWindow(code), SCORE_WINDOW_SECONDS * 1000);
     game.pendingRoundDetails = {
       reason: 'valid_declaration',
       message: `${actor.name} made a valid declaration. Scores finalize when the 30-second timer reaches 0.`,
@@ -1240,12 +1446,12 @@ function submitDeclarationShow(code, actor) {
       roundWinnerPlayerId: actor.playerId,
     };
   } else {
-    return resumeAfterWrongShow(code, actor.playerId);
+    resumeAfterWrongShow(code, actor.playerId, 'wrong_declaration');
+    return { ok: true, valid: false, wrongShow: true, penalty: 80, reason: verdict.reason };
   }
 
   emitDeclarationWindowState(code);
-  broadcastGameState(code);
-  return {
+  const response = {
     ok: true,
     valid: verdict.valid,
     reason: verdict.reason,
@@ -1254,6 +1460,10 @@ function submitDeclarationShow(code, actor) {
     scoreWindowEndsAt: game.scoreWindowEndsAt,
     winnerPlayerId: game.roundWinnerPlayerId || null,
   };
+  advanceScoreWindowTurn(code, game.turnIndex);
+  response.roundOver = game.state !== 'score_window';
+  response.state = game.state;
+  return response;
 }
 
 function finalizeSplit(code) {
@@ -1304,31 +1514,13 @@ function finalizeSplit(code) {
 
 function stopActiveGameForExit(code, playerId, playerName, reason = 'left') {
   const game = games[code];
-  if (!game || game.state !== 'playing') return false;
-
-  if (game.nextRoundTimer) {
-    clearTimeout(game.nextRoundTimer);
-    game.nextRoundTimer = null;
-  }
-  if (game.scoreWindowTimer) {
-    clearTimeout(game.scoreWindowTimer);
-    game.scoreWindowTimer = null;
-  }
-
-  const safeName = String(playerName || 'A player').trim() || 'A player';
-  game.state = 'stopped';
-  io.to(code).emit('game_stopped', {
-    code,
-    stoppedByPlayerId: playerId || null,
-    stoppedByName: safeName,
-    reason,
-    message: `${safeName} stopped the game. Play a new game with your friend.`,
-    canReplayInRoom: true,
-  });
-
-  // The current hand must never continue after a real player exits. Removing
-  // the game object also makes the room immediately reusable for a new friend.
-  delete games[code];
+  if (!game) return false;
+  const player = game.players.find(p => p.playerId === playerId);
+  if (!player) return false;
+  player.hasLeft = true;
+  player.isActive = false;
+  player.permanentlyDisconnected = reason === 'connection_closed';
+  syncDealerCrown(game);
   return true;
 }
 
@@ -1339,6 +1531,29 @@ function removePlayerAfterGrace(code, playerId) {
   const player = room.players.find((p) => p.playerId === playerId);
   if (!player || player.connected) return;
 
+  // Keep disconnected hands for authoritative timeout scoring and the result
+  // snapshot. Leaving cannot remove a hand or terminate this window early.
+  const pendingGame = games[code];
+  player.hasLeft = true;
+  player.isActive = false;
+  const exitingGamePlayer = pendingGame?.players.find(p => p.playerId === playerId);
+  if (exitingGamePlayer) {
+    exitingGamePlayer.hasLeft = true;
+    exitingGamePlayer.isActive = false;
+    exitingGamePlayer.permanentlyDisconnected = true;
+    syncDealerCrown(pendingGame);
+  }
+  if (pendingGame?.state === 'score_window' && pendingGame.scoreWindowStage === 'score') {
+    const key = timerKey(code, playerId);
+    clearDisconnectTimer(code, playerId);
+    disconnectTimers.set(key, setTimeout(() => {
+      disconnectTimers.delete(key);
+      removePlayerAfterGrace(code, playerId);
+    }, Math.max(1, pendingGame.scoreWindowEndsAt - Date.now()) + ROUND_RESULT_SECONDS * 1000));
+    broadcastGameState(code);
+    return;
+  }
+
   const removedRoomIndex = room.players.findIndex((p) => p.playerId === playerId);
   if (removedRoomIndex >= 0) room.players.splice(removedRoomIndex, 1);
 
@@ -1347,6 +1562,7 @@ function removePlayerAfterGrace(code, playerId) {
     const previousTurnPlayerId = game.players[game.turnIndex]?.playerId || null;
     const removedGameIndex = game.players.findIndex((p) => p.playerId === playerId);
     if (removedGameIndex >= 0) {
+      if (playerId === game.initialOpenJokerPlayerId) game.initialOpenJokerAvailable = false;
       game.players.splice(removedGameIndex, 1);
       delete game.handsByPlayerId[playerId];
       delete game.scoresByPlayerId[playerId];
@@ -1359,14 +1575,23 @@ function removePlayerAfterGrace(code, playerId) {
       } else {
         if (removedGameIndex < game.turnIndex) game.turnIndex -= 1;
         if (game.turnIndex >= game.players.length) game.turnIndex = 0;
-        if (game.dealerIndex >= game.players.length) game.dealerIndex = 0;
+        syncDealerCrown(game);
 
-        if (game.state === 'playing' && game.players.length === 1) {
+        if (['playing', 'initial_deal'].includes(game.state) && activeRoundPlayers(game).length <= 1) {
           finishRound(code, {
             reason: 'opponents_left',
-            message: `${game.players[0].name} wins because all opponents left the room.`,
+            roundWinnerPlayerId: activeRoundPlayers(game)[0]?.playerId || null,
+            message: 'Round completed because no other active opponent remains.',
           });
         } else {
+          if (game.state === 'round_over' && eligibleRolePlayers(game).length <= 1) {
+            game.state = 'finished';
+            game.winnerPlayerId = eligibleRolePlayers(game)[0]?.playerId || game.roundWinnerPlayerId || null;
+            game.rejoinCandidatePlayerIds = [];
+            game.rejoinEndsAt = null;
+            if (game.nextRoundTimer) clearTimeout(game.nextRoundTimer);
+            game.nextRoundTimer = null;
+          }
           const currentStillValid = game.players[game.turnIndex]?.playerId === previousTurnPlayerId
             && isRoundActive(game, game.players[game.turnIndex]);
           if (game.state === 'playing' && !currentStillValid) {
@@ -1476,6 +1701,9 @@ function makeInitialGame(currentRoom, players) {
     scoreWindowInterval: null,
     pendingScoreSubmissions: {},
     submittedScorePlayerIds: new Set(),
+    declaredPlayerIds: new Set(),
+    rejoinCandidatePlayerIds: [],
+    rejoinEndsAt: null,
     splitConfirmedPlayerIds: new Set(),
     splitFinalized: false,
     splitResult: null,
@@ -1484,7 +1712,7 @@ function makeInitialGame(currentRoom, players) {
 }
 
 function initialDealOrder(game) {
-  const active = game.players.filter((player) => !isEliminated(game, player.playerId));
+  const active = game.players.filter(player => game.roundParticipantPlayerIds?.includes(player.playerId));
   if (!active.length) return [];
   const dealerPlayerId = game.players[game.dealerIndex]?.playerId;
   const dealerActiveIndex = active.findIndex((player) => player.playerId === dealerPlayerId);
@@ -1505,6 +1733,10 @@ function buildInitialDealPayload(code, game, playerId, common = {}) {
     seatingDraw: game.seatingDraw || [],
     highCardPlayerId: game.highCardPlayerId || null,
     dealerPlayerId: game.players[game.dealerIndex]?.playerId || null,
+    crownPlayerId: game.crownPlayerId || null,
+    distributorPlayerId: game.distributorPlayerId || null,
+    eligiblePlayerIds: [...(game.eligiblePlayerIds || [])],
+    roundParticipantPlayerIds: [...(game.roundParticipantPlayerIds || [])],
     dealOrderPlayerIds: order.map((player) => player.playerId),
     cardsPerPlayer: 13,
     cardFlightMs: INITIAL_DEAL_FLIGHT_MS,
@@ -1889,6 +2121,12 @@ io.on('connection', (socket) => {
     }
 
     let player = room.players.find((p) => p.playerId === playerId);
+    if (player && (player.hasLeft || player.isActive === false)) {
+      const response = { ok: false, message: 'This seat has left the match.' };
+      socket.emit('room_error', response);
+      ack?.(response);
+      return;
+    }
     if (room.gameStartScheduled && !player) {
       const response = { ok: false, message: 'This game is starting. New seats are locked until the session is restarted.' };
       socket.emit('room_error', response);
@@ -1937,6 +2175,8 @@ io.on('connection', (socket) => {
 
     clearDisconnectTimer(code, playerId);
     stopActiveGameForExit(code, playerId, player.name, 'player_left');
+    player.hasLeft = true;
+    player.isActive = false;
     player.connected = false;
     const gamePlayer = games[code]?.players.find((p) => p.playerId === playerId);
     if (gamePlayer) gamePlayer.connected = false;
@@ -1952,7 +2192,7 @@ io.on('connection', (socket) => {
     const room = rooms[code];
     const player = room?.players.find((p) => p.playerId === playerId);
 
-    if (!room || !player) {
+    if (!room || !player || player.hasLeft || player.isActive === false) {
       ack?.({ ok: false, message: 'Room is no longer available.' });
       return;
     }
@@ -1977,7 +2217,7 @@ io.on('connection', (socket) => {
     }
 
     const player = findGamePlayer(game, playerId, socket.id);
-    if (!player) {
+    if (!player || player.hasLeft || player.isActive === false) {
       ack?.({ ok: false, message: 'Player is not part of this game.' });
       return;
     }
@@ -2053,7 +2293,7 @@ io.on('connection', (socket) => {
     const rankedPlayers = createSeatingDraw(connectedPlayers);
     room.pendingSeatingOrder = rankedPlayers;
     room.highCardPlayerId = rankedPlayers[0]?.playerId || null;
-    room.initialDealerPlayerId = rankedPlayers[0]?.playerId || null;
+    room.initialDealerPlayerId = rankedPlayers.at(-1)?.playerId || null;
     room.seatChoiceRequiredPlayerId = null;
     clearSeatingChoiceTimer(room);
 
@@ -2080,7 +2320,7 @@ io.on('connection', (socket) => {
       ack?.(response);
       return;
     }
-    if (game.state !== 'playing') {
+    if (!acceptsTurnMoves(game)) {
       const response = { ok: false, message: 'This round is not accepting moves.' };
       socket.emit('game_error', response);
       ack?.(response);
@@ -2115,7 +2355,7 @@ io.on('connection', (socket) => {
         return;
       }
       const openCard = game.discardPile[game.discardPile.length - 1];
-      if (ruleIsJokerCard(openCard, game.wildJoker) && game.initialOpenJokerAvailable !== true) {
+      if (ruleIsJokerCard(openCard, game.wildJoker) && !canTakeInitialOpenJoker(game, actor.playerId)) {
         const response = { ok: false, message: 'Joker cannot be picked from the open deck. Draw from the closed deck.' };
         socket.emit('game_error', response);
         ack?.(response);
@@ -2169,7 +2409,7 @@ io.on('connection', (socket) => {
       ack?.(response);
       return;
     }
-    if (game.state !== 'playing') {
+    if (!acceptsTurnMoves(game)) {
       const response = { ok: false, message: 'This round is not accepting moves.' };
       socket.emit('game_error', response);
       ack?.(response);
@@ -2255,6 +2495,7 @@ io.on('connection', (socket) => {
     const penalty = game.drawnPlayerIds.has(actor.playerId) ? 40 : 20;
     addPoints(game, actor.playerId, penalty);
     game.droppedPlayerIds.add(actor.playerId);
+    game.initialOpenJokerAvailable = false;
     io.to(code).emit('player_dropped', { code, playerId: actor.playerId, penalty });
 
     const stillPlaying = activeRoundPlayers(game);
@@ -2289,6 +2530,7 @@ io.on('connection', (socket) => {
     const game = games[code];
     const actor = findGamePlayer(game, playerId, socket.id);
     const response = beginDeclarationWindow(code, actor, cardId);
+    response.roundNumber = game?.roundNumber;
     if (!response.ok) socket.emit('game_error', response);
     ack?.(response);
   };
@@ -2298,65 +2540,39 @@ io.on('connection', (socket) => {
   socket.on('begin_declare', handleBeginDeclaration);
   socket.on('declare', handleBeginDeclaration);
 
-  socket.on('first_card_declare', (payload = {}, ack) => {
-    const code = normaliseCode(payload.code);
-    const actor = findGamePlayer(games[code], String(payload.playerId || '').trim(), socket.id);
-    ack?.(declareInitialHand(code, actor));
-  });
-
   socket.on('confirm_declaration', (payload = {}, ack) => {
     const code = normaliseCode(payload.code);
     const playerId = String(payload.playerId || '').trim();
     const game = games[code];
     const actor = findGamePlayer(game, playerId, socket.id);
     const response = submitDeclarationShow(code, actor);
+    response.roundNumber = game?.roundNumber;
     if (!response.ok) socket.emit('game_error', response);
     ack?.(response);
   });
 
   socket.on('submit_round_score', (payload = {}, ack) => {
-    const code = normaliseCode(payload.code);
-    const playerId = String(payload.playerId || '').trim();
-    const game = games[code];
-    if (!game || game.state !== 'score_window' || game.scoreWindowStage !== 'score') {
-      ack?.({ ok: false, message: game?.scoreWindowStage === 'declare' ? 'Wait for the finishing player to press DECLARE SHOW.' : 'The score window is not open.' });
-      return;
-    }
-    if (!game.scoreWindowEndsAt || Date.now() >= game.scoreWindowEndsAt) {
-      ack?.({ ok: false, message: 'The 30-second score window has expired.' });
-      return;
-    }
-    const actor = findGamePlayer(game, playerId, socket.id);
-    if (!actor) {
-      ack?.({ ok: false, message: 'Player is not part of this game.' });
-      return;
-    }
-    if (actor.playerId === game.roundWinnerPlayerId) {
-      ack?.({ ok: false, message: 'The round winner has 0 points and does not submit a score.' });
-      return;
-    }
-    if (game.droppedPlayerIds.has(actor.playerId)) {
-      ack?.({ ok: false, message: 'Your drop/wrong-show penalty is already locked for this round.' });
-      return;
-    }
-    if (game.submittedScorePlayerIds?.has(actor.playerId)) {
-      ack?.({ ok: true, alreadySubmitted: true, score: game.pendingScoreSubmissions?.[actor.playerId] ?? 0 });
-      return;
-    }
+    // Legacy clients cannot bypass Declare-only validation with a score commit.
+    ack?.({ ok: false, message: 'Only Declare is allowed. Submit your existing 13-card declaration.' });
+  });
 
-    const score = calculateDeadwood(game.handsByPlayerId[actor.playerId] || [], game.wildJoker);
-    game.pendingScoreSubmissions[actor.playerId] = score;
-    game.submittedScorePlayerIds.add(actor.playerId);
-    const event = {
-      code,
-      playerId: actor.playerId,
-      score,
-      submittedPlayerIds: [...game.submittedScorePlayerIds],
-      scoreWindowEndsAt: game.scoreWindowEndsAt,
-    };
-    io.to(code).emit('score_submitted', event);
+  socket.on('rejoin_game', (payload = {}, ack) => {
+    const code = normaliseCode(payload.code);
+    const game = games[code];
+    const actor = findGamePlayer(game, String(payload.playerId || '').trim(), socket.id);
+    if (!game || !actor || actor.hasLeft || actor.isActive === false || actor.permanentlyDisconnected
+      || game.state !== 'round_over' || !game.rejoinEndsAt || Date.now() >= game.rejoinEndsAt
+      || !game.rejoinCandidatePlayerIds?.includes(actor.playerId) || !rejoinCandidates(game).includes(actor.playerId)) {
+      ack?.({ ok: false, message: 'Rejoin is not available for this player or this round.' });
+      return;
+    }
+    const startingScore = rejoinStartingScore(game);
+    game.scoresByPlayerId[actor.playerId] = startingScore;
+    game.rejoinCandidatePlayerIds = rejoinCandidates(game);
+    syncDealerCrown(game);
+    io.to(code).emit('player_rejoined_game', { code, playerId: actor.playerId, startingScore });
     broadcastGameState(code);
-    ack?.({ ok: true, score, scoreWindowEndsAt: game.scoreWindowEndsAt });
+    ack?.({ ok: true, startingScore });
   });
 
   socket.on('confirm_split', (payload = {}, ack) => {
@@ -2411,12 +2627,21 @@ io.on('connection', (socket) => {
       ack?.({ ok: false, message: 'The next round is not ready yet.' });
       return;
     }
-
-    // No participant can skip the completed scoreboard for the whole room.
-    if (game.nextRoundAt && Date.now() < game.nextRoundAt) {
-      ack?.({ ok:true, queued:true, code, roundNumber:game.roundNumber, nextRoundAt:game.nextRoundAt });
+    if (game.rejoinEndsAt && Date.now() < game.rejoinEndsAt && game.rejoinCandidatePlayerIds?.length) {
+      ack?.({ ok: false, message: 'Wait for the current rejoin window to close.', rejoinEndsAt: game.rejoinEndsAt });
       return;
     }
+    if (eligibleRolePlayers(game).length <= 1) {
+      game.state = 'finished';
+      game.rejoinCandidatePlayerIds = [];
+      game.rejoinEndsAt = null;
+      game.winnerPlayerId = eligibleRolePlayers(game)[0]?.playerId || game.roundWinnerPlayerId || null;
+      syncDealerCrown(game);
+      broadcastGameState(code);
+      ack?.({ ok: false, message: 'The pool is finished.', winnerPlayerId: game.winnerPlayerId });
+      return;
+    }
+
     if (game.nextRoundTimer) {
       clearTimeout(game.nextRoundTimer);
       game.nextRoundTimer = null;
@@ -2433,20 +2658,13 @@ io.on('connection', (socket) => {
       const player = room.players.find((p) => p.id === socket.id);
       if (!player) continue;
 
-      const stoppedActiveGame = stopActiveGameForExit(code, player.playerId, player.name, 'connection_closed');
       player.connected = false;
       const gamePlayer = games[code]?.players.find((p) => p.playerId === player.playerId);
       if (gamePlayer) gamePlayer.connected = false;
       emitRoomUpdate(code);
+      broadcastGameState(code);
 
       clearDisconnectTimer(code, player.playerId);
-      if (stoppedActiveGame) {
-        // During an active real-player game, a closed connection ends the hand
-        // immediately and frees the seat so the friend can start a fresh game.
-        removePlayerAfterGrace(code, player.playerId);
-        continue;
-      }
-
       const key = timerKey(code, player.playerId);
       const timer = setTimeout(() => {
         disconnectTimers.delete(key);
