@@ -689,7 +689,8 @@ function buildSplitOffer(game) {
   const remaining = eligibleRolePlayers(game);
   if (!SPLIT_COUNTS.has(remaining.length) || game.splitFinalized) return null;
   const poolAmount = safePoolAmount(game);
-  if (poolAmount <= 0) return null;
+  // A free three-player room may also agree to end the pool, without a payout.
+  if (poolAmount <= 0 && remaining.length !== 3) return null;
 
   // Work in paise so the total can never exceed or fall short of the pool.
   const poolPaise = Math.round(poolAmount * 100);
