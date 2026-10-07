@@ -562,6 +562,7 @@ function isRoundActive(game, player) {
     && !player.hasLeft && !player.removed && !player.permanentlyDisconnected
     && (!Array.isArray(game.roundParticipantPlayerIds) || game.roundParticipantPlayerIds.includes(player.playerId))
     && !isEliminated(game, player.playerId)
+    && Number(game.scoresByPlayerId[player.playerId] || 0) < 80
     && !game.droppedPlayerIds.has(player.playerId)
     && !(game.state === 'score_window' && game.scoreWindowStage === 'score'
       && (game.declaredPlayerIds?.has(player.playerId) || game.submittedScorePlayerIds?.has(player.playerId)));
@@ -604,6 +605,7 @@ function eligibleRolePlayers(game) {
 function rejoinCandidates(game) {
   const survivors = activeGamePlayers(game);
   if (!survivors.length || survivors.some((player) => (game.scoresByPlayerId[player.playerId] || 0) >= 80)) return [];
+  if (Math.max(...survivors.map(player => Number(game.scoresByPlayerId[player.playerId] || 0))) + 1 >= 80) return [];
   return game.players.filter((player) => isEliminated(game, player.playerId)).map((player) => player.playerId);
 }
 
@@ -932,6 +934,7 @@ function scoreWindowRequiredPlayerIds(game) {
     .filter((player) => !game.declaredPlayerIds?.has(player.playerId))
     .filter((player) => !game.droppedPlayerIds.has(player.playerId))
     .filter((player) => !isEliminated(game, player.playerId))
+    .filter((player) => Number(game.scoresByPlayerId[player.playerId] || 0) < 80)
     .map((player) => player.playerId);
 }
 
@@ -946,7 +949,8 @@ function buildSnapshot(game, forPlayerId) {
     seatingCard: p.seatingCard || null,
     hasCrown: !!p.hasCrown,
     hasDealer: !!p.hasDealer,
-    roundEligible: !Array.isArray(game.roundParticipantPlayerIds) || game.roundParticipantPlayerIds.includes(p.playerId),
+    roundEligible: Number(game.scoresByPlayerId[p.playerId] || 0) < 80
+      && (!Array.isArray(game.roundParticipantPlayerIds) || game.roundParticipantPlayerIds.includes(p.playerId)),
     handSize: (game.handsByPlayerId[p.playerId] || []).length,
     score: game.scoresByPlayerId[p.playerId] || 0,
     roundPoints: game.roundPointsByPlayerId[p.playerId] || 0,
@@ -1209,7 +1213,7 @@ function finalizeScoreWindow(code) {
   for (const player of game.players) {
     if (player.playerId === winnerId || game.declaredPlayerIds?.has(player.playerId)) continue;
     if (game.droppedPlayerIds.has(player.playerId)) continue; // drop/wrong-show penalty already recorded
-    if (isEliminated(game, player.playerId)) continue;
+    if (isEliminated(game, player.playerId) || Number(game.scoresByPlayerId[player.playerId] || 0) >= 80) continue;
     const submitted = game.pendingScoreSubmissions?.[player.playerId];
     const score = Number.isFinite(submitted)
       ? submitted
@@ -2029,7 +2033,7 @@ function scheduleGameStart(code) {
 }
 
 app.get('/', (req, res) => {
-  res.json({ ok: true, service: 'Star Rummy multiplayer', rooms: Object.keys(rooms).length });
+  res.json({ ok: true, service: 'Star Rummy multiplayer', version: '1.7.24', playScoreLimit: 80, rooms: Object.keys(rooms).length });
 });
 
 io.on('connection', (socket) => {
