@@ -562,7 +562,7 @@ function isRoundActive(game, player) {
     && !player.hasLeft && !player.removed && !player.permanentlyDisconnected
     && (!Array.isArray(game.roundParticipantPlayerIds) || game.roundParticipantPlayerIds.includes(player.playerId))
     && !isEliminated(game, player.playerId)
-    && Number(game.scoresByPlayerId[player.playerId] || 0) < 80
+    && Number(game.scoresByPlayerId[player.playerId] || 0) < 101
     && !game.droppedPlayerIds.has(player.playerId)
     && !(game.state === 'score_window' && game.scoreWindowStage === 'score'
       && (game.declaredPlayerIds?.has(player.playerId) || game.submittedScorePlayerIds?.has(player.playerId)));
@@ -592,25 +592,26 @@ function activeGamePlayers(game) {
   return game.players.filter((player) => !isEliminated(game, player.playerId));
 }
 
-// Next-round participation is independent of 101-point elimination and of a
+// Next-round participation uses 101-point elimination and is independent of a
 // temporary network loss. A disconnected seat remains reserved for the
 // existing reconnect grace period; only a permanent exit removes eligibility.
 function eligibleRolePlayers(game) {
   return (game.players || []).filter(player => player.playerId
     && player.isActive !== false && player.seatActive !== false
     && !player.hasLeft && !player.removed && !player.permanentlyDisconnected
-    && Number(game.scoresByPlayerId?.[player.playerId] ?? 0) < 80);
+    && Number(game.scoresByPlayerId?.[player.playerId] ?? 0) < 101);
 }
 
 function rejoinCandidates(game) {
-  const survivors = activeGamePlayers(game);
+  const survivors = eligibleRolePlayers(game);
   if (!survivors.length || survivors.some((player) => (game.scoresByPlayerId[player.playerId] || 0) >= 80)) return [];
-  if (Math.max(...survivors.map(player => Number(game.scoresByPlayerId[player.playerId] || 0))) + 1 >= 80) return [];
-  return game.players.filter((player) => isEliminated(game, player.playerId)).map((player) => player.playerId);
+  return game.players.filter(player => isEliminated(game, player.playerId)
+    && player.isActive !== false && player.seatActive !== false
+    && !player.hasLeft && !player.removed && !player.permanentlyDisconnected).map(player => player.playerId);
 }
 
 function rejoinStartingScore(game) {
-  return Math.max(...activeGamePlayers(game).map((player) => game.scoresByPlayerId[player.playerId] || 0), 0) + 1;
+  return Math.max(...eligibleRolePlayers(game).map((player) => game.scoresByPlayerId[player.playerId] || 0), 0) + 1;
 }
 
 // Preserve the ORIGINAL next-lower card distributor rotation for the session.
@@ -935,7 +936,7 @@ function scoreWindowRequiredPlayerIds(game) {
     .filter((player) => !game.declaredPlayerIds?.has(player.playerId))
     .filter((player) => !game.droppedPlayerIds.has(player.playerId))
     .filter((player) => !isEliminated(game, player.playerId))
-    .filter((player) => Number(game.scoresByPlayerId[player.playerId] || 0) < 80)
+    .filter((player) => Number(game.scoresByPlayerId[player.playerId] || 0) < 101)
     .map((player) => player.playerId);
 }
 
@@ -950,7 +951,7 @@ function buildSnapshot(game, forPlayerId) {
     seatingCard: p.seatingCard || null,
     hasCrown: !!p.hasCrown,
     hasDealer: !!p.hasDealer,
-    roundEligible: Number(game.scoresByPlayerId[p.playerId] || 0) < 80
+    roundEligible: Number(game.scoresByPlayerId[p.playerId] || 0) < 101
       && (!Array.isArray(game.roundParticipantPlayerIds) || game.roundParticipantPlayerIds.includes(p.playerId)),
     handSize: (game.handsByPlayerId[p.playerId] || []).length,
     score: game.scoresByPlayerId[p.playerId] || 0,
@@ -1115,7 +1116,7 @@ function finishRound(code, details = {}) {
   const remaining = eligibleRolePlayers(game);
   game.rejoinCandidatePlayerIds = rejoinCandidates(game);
   game.rejoinEndsAt = game.rejoinCandidatePlayerIds.length ? Date.now() + ROUND_RESULT_SECONDS * 1000 : null;
-  if (remaining.length <= 1) {
+  if (remaining.length <= 1 && !game.rejoinCandidatePlayerIds.length) {
     game.state = 'finished';
     game.winnerPlayerId = remaining[0]?.playerId || game.roundWinnerPlayerId || null;
     game.rejoinCandidatePlayerIds = [];
@@ -1214,7 +1215,7 @@ function finalizeScoreWindow(code) {
   for (const player of game.players) {
     if (player.playerId === winnerId || game.declaredPlayerIds?.has(player.playerId)) continue;
     if (game.droppedPlayerIds.has(player.playerId)) continue; // drop/wrong-show penalty already recorded
-    if (isEliminated(game, player.playerId) || Number(game.scoresByPlayerId[player.playerId] || 0) >= 80) continue;
+    if (isEliminated(game, player.playerId)) continue;
     const submitted = game.pendingScoreSubmissions?.[player.playerId];
     const score = Number.isFinite(submitted)
       ? submitted
@@ -2034,7 +2035,7 @@ function scheduleGameStart(code) {
 }
 
 app.get('/', (req, res) => {
-  res.json({ ok: true, service: 'Star Rummy multiplayer', version: '1.7.26', playScoreLimit: 80, rooms: Object.keys(rooms).length });
+  res.json({ ok: true, service: 'Star Rummy multiplayer', version: '1.7.28', playScoreLimit: 101, rejoinLockScore: 80, rooms: Object.keys(rooms).length });
 });
 
 io.on('connection', (socket) => {
