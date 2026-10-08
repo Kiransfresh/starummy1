@@ -2,6 +2,9 @@
 import express from 'express';
 import { createServer } from 'http';
 import { Server } from 'socket.io';
+import { normalizeSplitRules, splitEligible, allocateSplitTokens, distributableTokens } from './server/splitRules.js';
+import { publicPagesRouter } from './server/publicPages.js';
+import { billingConfigured, verifyAndCreditPlayPurchase } from './server/playBilling.js';
 
 
 // Railway-safe 101-pool rules. These are intentionally embedded in the
@@ -287,6 +290,7 @@ function calculateFirstCardPenalty(hand, wildJoker = null) {
   return Math.min(80, Math.max(0, total - covered((1 << cards.length) - 1)));
 }
 const app = express();
+app.use(publicPagesRouter());
 const httpServer = createServer(app);
 
 const io = new Server(httpServer, {
@@ -318,7 +322,6 @@ const TURN_EXTRA_SECONDS = 30;
 const ROUND_RESULT_SECONDS = 8;
 const REJOIN_LOCK_SCORE = 79;
 const MAX_REJOINS_PER_MATCH = 1;
-const SPLIT_COUNTS = new Set([2, 3]);
 
 function normaliseTableSize(value) {
   const parsed = Math.floor(Number(value) || MAX_PLAYERS);
@@ -702,7 +705,7 @@ async function confirmPaidRejoin(code, game, actor, idToken) {
   assertEligible();
   const details = { uid, matchId: game.matchId, playerId: actor.playerId, fee: game.entryFee,
     score: rejoinStartingScore(game), roundNumber: game.roundNumber,
-    poolAfter: safePoolAmount(game) + game.entryFee, assertEligible };
+    poolAfter: game.poolAmount + game.entryFee, fundedPool:true, assertEligible };
   const receipt = await wallet.chargeRejoinTokens(details);
   // A socket disconnect is temporary, not a failure. A permanent exit after
   // committing is rolled back, without reactivating a left seat.
@@ -782,28 +785,27 @@ function syncDealerCrown(game, options = {}) {
 }
 
 function safePoolAmount(game) {
-  return Math.max(0, Number(game.poolAmount) || 0);
+  return distributableTokens(Math.max(0, Math.floor(Number(game.poolAmount) || 0)), game.splitRules?.feeBps || 0);
 }
 
 function buildSplitOffer(game) {
+  if (game.splitFinalized || game.poolSettled) return null;
+  const pending = game.splitProposal;
   const remaining = eligibleRolePlayers(game);
-  if (!SPLIT_COUNTS.has(remaining.length) || game.splitFinalized) return null;
-  const poolAmount = safePoolAmount(game);
-  // A free three-player room may also agree to end the pool, without a payout.
-  if (poolAmount <= 0 && remaining.length !== 3) return null;
-
-  // Work in paise so the total can never exceed or fall short of the pool.
-  const poolPaise = Math.round(poolAmount * 100);
-  if (poolPaise % remaining.length !== 0) return null;
-  const sharePaise = poolPaise / remaining.length;
+  const pendingRejoin = game.rejoinEndsAt > Date.now() && rejoinCandidates(game).length > 0;
+  if (!pending && !splitEligible(game, remaining, pendingRejoin)) return null;
+  const rules = normalizeSplitRules(game.splitRules);
+  const players = pending?.players || allocateSplitTokens(safePoolAmount(game), remaining.map(p=>({playerId:p.playerId,name:p.name,avatar:p.avatar,gender:p.gender,score:game.scoresByPlayerId[p.playerId] || 0})), rules);
   const confirmed = game.splitConfirmedPlayerIds || new Set();
   return {
-    eligible: true,
-    playerCount: remaining.length,
-    poolAmount: poolPaise / 100,
-    shareAmount: sharePaise / 100,
-    playerIds: remaining.map((player) => player.playerId),
-    confirmedPlayerIds: remaining.filter((player) => confirmed.has(player.playerId)).map((player) => player.playerId),
+    eligible:true, playerCount:players.length, poolAmount:pending?.poolAmount ?? safePoolAmount(game),
+    playerIds:players.map(p=>p.playerId), players:players.map(p=>({...p,connected:game.players.find(x=>x.playerId===p.playerId)?.connected !== false})),
+    sharesByPlayerId:Object.fromEntries(players.map(p=>[p.playerId,p.tokens])),
+    method:rules.method, proposalId:pending?.id || null, endsAt:pending?.endsAt || null,
+    twoPlayerConfigured:game.originTableSize===2 && rules.tableTypes.includes(2) && rules.minPlayers===2,
+    originTableSize:game.originTableSize, manualButton:rules.manualButton, autoPopup:rules.autoPopup, precision:rules.precision,
+    settlementPending:!!game.settlementPending, locked:!!pending?.locked, error:game.settlementError || '',
+    confirmedPlayerIds:players.filter(p=>confirmed.has(p.playerId)).map(p=>p.playerId),
     requiresAllPlayers: true,
   };
 }
@@ -849,7 +851,119 @@ function addPoints(game, playerId, points) {
   return true;
 }
 
+// Optional repeated-timeout policy. Disabled by default; one missed turn
+// always retains the existing client auto-draw/auto-discard behavior.
+function autoDropThreshold() {
+  const configured = Number(process.env.AUTO_DROP_MISSED_TURNS || 0);
+  return Number.isFinite(configured) && configured >= 2 ? Math.min(10, Math.floor(configured)) : 0;
+}
+
+function dropOfferFor(game, playerId) {
+  const player = game.players.find(p => p.playerId === playerId);
+  const currentScore = Number(game.scoresByPlayerId[playerId] || 0);
+  const hasDrawn = game.drawnPlayerIds?.has(playerId) || false;
+  const penalty = hasDrawn ? 40 : 20;
+  const handSize = game.handsByPlayerId[playerId]?.length || 0;
+  return {
+    allowed: game.state === 'playing' && game.players[game.turnIndex]?.playerId === playerId
+      && isRoundActive(game, player) && !game.scoredPlayerIds?.has(playerId) && [13, 14].includes(handSize),
+    roundNumber: game.roundNumber, currentScore, penalty,
+    type: hasDrawn ? 'Middle drop' : 'First drop',
+    projectedScore: currentScore + penalty, eliminated: currentScore + penalty >= 101,
+  };
+}
+
+function applyRoundDrop(code, game, actor, reason = 'voluntary') {
+  const offer = dropOfferFor(game, actor.playerId);
+  if (!offer.allowed || !addPoints(game, actor.playerId, offer.penalty)) {
+    return { ok: false, message: 'This drop is no longer available.' };
+  }
+  game.droppedPlayerIds.add(actor.playerId);
+  game.initialOpenJokerAvailable = false;
+  const result = { ok: true, playerId: actor.playerId, roundNumber: game.roundNumber,
+    previousScore: offer.currentScore, penalty: offer.penalty, totalScore: offer.projectedScore,
+    dropType: offer.type, status: offer.eliminated ? 'ELIMINATED' : 'DROPPED', reason };
+  io.to(code).emit('player_dropped', { code, ...result });
+  const stillPlaying = activeRoundPlayers(game);
+  if (stillPlaying.length <= 1) {
+    finishRound(code, {
+      reason: 'last_player_after_drop', roundWinnerPlayerId: stillPlaying[0]?.playerId || null,
+      message: stillPlaying.length === 1
+        ? `${stillPlaying[0].name} wins the round after the other players dropped.`
+        : 'Round ended because no active players remain.',
+    });
+    return { ...result, roundOver: true };
+  }
+  const nextTurnIndex = nextPlayableIndex(game, game.turnIndex);
+  if (nextTurnIndex < 0) {
+    finishRound(code, { reason: 'no_connected_players', message: 'Round paused because no active player is connected.' });
+    return { ...result, roundOver: true };
+  }
+  game.turnIndex = nextTurnIndex;
+  broadcastGameState(code);
+  return { ...result, roundOver: false, nextTurnPlayerId: game.players[nextTurnIndex]?.playerId || null };
+}
+
+function clearDropTurnClock(game) {
+  if (game.dropTurnTimer) clearTimeout(game.dropTurnTimer);
+  game.dropTurnTimer = null;
+  game.dropTurnClock = null;
+}
+
+function noteMissedTurn(code, game, turnId) {
+  const clock = game.dropTurnClock;
+  const actor = game.players[game.turnIndex];
+  if (!clock || clock.id !== turnId || Date.now() < clock.endsAt
+    || game.state !== 'playing' || !isRoundActive(game, actor) || actor.connected === false) return false;
+  if (!clock.missed) {
+    clock.missed = true;
+    game.missedTurnsByPlayerId ||= {};
+    game.missedTurnsByPlayerId[actor.playerId] = (game.missedTurnsByPlayerId[actor.playerId] || 0) + 1;
+  }
+  const threshold = autoDropThreshold();
+  if (threshold && game.missedTurnsByPlayerId[actor.playerId] >= threshold) {
+    return applyRoundDrop(code, game, actor, 'repeated_timeout').ok;
+  }
+  return false;
+}
+
+function syncDropTurnClock(code, game) {
+  const actor = game.players[game.turnIndex];
+  if (game.state !== 'playing' || !isRoundActive(game, actor)) {
+    clearDropTurnClock(game);
+    return;
+  }
+  const key = `${game.roundNumber}:${actor.playerId}`;
+  if (game.dropTurnClock?.key === key) return;
+  clearDropTurnClock(game);
+  const now = Date.now();
+  const clock = { key, id: `${key}:${game.dropTurnSerial = (game.dropTurnSerial || 0) + 1}`,
+    startedAt: now, endsAt: now + (TURN_MAIN_SECONDS + TURN_EXTRA_SECONDS) * 1000, missed: false };
+  game.dropTurnClock = clock;
+  if (autoDropThreshold()) game.dropTurnTimer = setTimeout(() => {
+    if (games[code] === game) noteMissedTurn(code, game, clock.id);
+  }, clock.endsAt - now);
+}
+
+function validateDropTurnRequest(code, game, payload) {
+  if (payload.roundNumber != null && Number(payload.roundNumber) !== game.roundNumber) {
+    return { ok: false, message: 'That request belongs to an earlier round.' };
+  }
+  if (payload.turnId != null && payload.turnId !== game.dropTurnClock?.id) {
+    return { ok: false, message: 'That turn has already ended.' };
+  }
+  if (payload.timeout === true) {
+    if (!game.dropTurnClock || Date.now() < game.dropTurnClock.endsAt) {
+      return { ok: false, message: 'The turn timer has not expired.' };
+    }
+    if (noteMissedTurn(code, game, game.dropTurnClock.id)) return { ok: true, autoDropped: true };
+  }
+  return null;
+}
+
 function dealRound(game, incrementRound = true) {
+  clearDropTurnClock(game);
+  game.missedTurnsByPlayerId = {};
   if (game.nextRoundTimer) {
     clearTimeout(game.nextRoundTimer);
     game.nextRoundTimer = null;
@@ -1028,7 +1142,7 @@ function bindPlayerSocket(code, player, socket) {
 
 function findGamePlayer(game, playerId, socketId) {
   return game?.players.find((p) =>
-    (playerId && p.playerId === playerId) || p.id === socketId
+    p.id === socketId && (!playerId || p.playerId === playerId)
   );
 }
 
@@ -1104,6 +1218,13 @@ function buildSnapshot(game, forPlayerId) {
     turnMainSeconds: TURN_MAIN_SECONDS,
     turnExtraSeconds: TURN_EXTRA_SECONDS,
     turnTotalSeconds: TURN_MAIN_SECONDS + TURN_EXTRA_SECONDS,
+    serverNow: Date.now(),
+    turnId: game.dropTurnClock?.id || null,
+    turnStartedAt: game.dropTurnClock?.startedAt || null,
+    turnEndsAt: game.dropTurnClock?.endsAt || null,
+    autoDropMissedTurns: autoDropThreshold(),
+    hasDrawnThisRound: game.drawnPlayerIds?.has(forPlayerId) || false,
+    dropOffer: dropOfferFor(game, forPlayerId),
     scoreWindowSecondsRemaining: game.scoreWindowEndsAt ? Math.max(0, Math.ceil((game.scoreWindowEndsAt - Date.now()) / 1000)) : null,
     requiredScorePlayerIds: scoreWindowRequiredPlayerIds(game),
     submittedScorePlayerIds: [...(game.submittedScorePlayerIds || new Set())],
@@ -1120,6 +1241,7 @@ function buildSnapshot(game, forPlayerId) {
     splitOffer: buildSplitOffer(game),
     splitFinalized: !!game.splitFinalized,
     splitResult: game.splitResult || null,
+    prizeResult:game.prizeResult || null, settlementPending:!!game.settlementPending, settlementError:game.settlementError || null,
     lastAction: game.lastAction || null,
   };
 }
@@ -1142,6 +1264,9 @@ function sendLatestRoundResult(code, player) {
 function broadcastGameState(code) {
   const game = games[code];
   if (!game) return;
+  syncDropTurnClock(code, game);
+  maybeAutoSplit(code, game);
+  if (game.state === 'finished' && game.winnerPlayerId && !game.splitFinalized && !game.poolSettled && !game.settlementPending && !game.settlementError) void settleWinner(code);
   for (const player of game.players) sendGameStateToPlayer(code, player);
 }
 
@@ -1172,6 +1297,7 @@ function buildRoundResult(code, game, forPlayerId, details = {}) {
     splitOffer: buildSplitOffer(game),
     splitFinalized: !!game.splitFinalized,
     splitResult: game.splitResult || null,
+    prizeResult:game.prizeResult || null, settlementPending:!!game.settlementPending, settlementError:game.settlementError || null,
     scoresByPlayerId: { ...game.scoresByPlayerId },
     roundPointsByPlayerId: { ...game.roundPointsByPlayerId },
     lastRoundPointsByPlayerId: { ...(game.lastRoundPointsByPlayerId || game.roundPointsByPlayerId) },
@@ -1245,6 +1371,7 @@ function finishRound(code, details = {}) {
 
   syncDealerCrown(game);
   game.lastRoundDetails = { ...details };
+  game.splitOfferShownAt=buildSplitOffer(game) ? Date.now() : null;
   for (const player of game.players) {
     if (!player.connected || !player.id) continue;
     io.to(player.id).emit('round_result', buildRoundResult(code, game, player.playerId, details));
@@ -1259,12 +1386,18 @@ function finishRound(code, details = {}) {
     const advanceAfterResults = () => {
       const current = games[code];
       if (!current || current.state !== 'round_over' || current.splitFinalized) return;
-      if (current.rejoinPaymentsPending > 0) {
+      if (current.rejoinPaymentsPending > 0 || current.splitProposal || current.settlementPending) {
         current.nextRoundTimer = setTimeout(advanceAfterResults, 200);
         return;
       }
       current.rejoinCandidatePlayerIds = [];
       current.rejoinEndsAt = null;
+      if(!current.splitOfferShownAt && buildSplitOffer(current)){
+        current.splitOfferShownAt=Date.now();
+        broadcastGameState(code);
+        current.nextRoundTimer=setTimeout(advanceAfterResults,ROUND_RESULT_SECONDS*1000);
+        return;
+      }
       if (eligibleRolePlayers(current).length <= 1) {
         current.state = 'finished';
         current.winnerPlayerId = eligibleRolePlayers(current)[0]?.playerId || current.roundWinnerPlayerId || null;
@@ -1593,24 +1726,111 @@ function submitDeclarationShow(code, actor) {
   return response;
 }
 
-function finalizeSplit(code) {
+async function loadPrizeWallet() { return import('./server/prizeWallet.js'); }
+
+function createSplitProposal(code, game, offer) {
+  game.splitRequestCount=(game.splitRequestCount || 0)+1;
+  game.splitRequestCountsByCount ||= {};
+  game.splitRequestCountsByCount[offer.playerCount]=(game.splitRequestCountsByCount[offer.playerCount] || 0)+1;
+  game.splitConfirmedPlayerIds=new Set();
+  game.splitProposal={id:`${game.matchId}:${game.splitRequestCount}`,players:offer.players,poolAmount:offer.poolAmount,
+    endsAt:Date.now()+normalizeSplitRules(game.splitRules).timeoutSeconds*1000};
+  game.splitProposal.timer=setTimeout(()=>cancelSplit(code,'Voting timed out. Not all players agreed. The game will continue until a winner is decided.'),game.splitProposal.endsAt-Date.now());
+}
+
+function maybeAutoSplit(code, game) {
+  if (game.splitProposal || !normalizeSplitRules(game.splitRules).autoPopup) return;
+  const offer=buildSplitOffer(game);
+  if (!offer) return;
+  const key=`${offer.playerCount}:${[...offer.playerIds].sort().join(',')}`;
+  game.autoSplitShownKeys ||= new Set();
+  if (game.autoSplitShownKeys.has(key)) return;
+  game.autoSplitShownKeys.add(key);
+  createSplitProposal(code, game, offer);
+  io.to(code).emit('split_update',{code,splitOffer:buildSplitOffer(game)});
+}
+
+function cancelSplit(code, message = 'Not all players agreed. The game will continue until a winner is decided.') {
+  const game=games[code];
+  if (!game?.splitProposal || game.settlementPending || game.splitProposal.locked) return false;
+  clearTimeout(game.splitProposal.timer);
+  game.splitProposal=null;
+  game.splitConfirmedPlayerIds=new Set();
+  game.settlementError=null;
+  io.to(code).emit('split_update',{code,splitOffer:null,declined:true,message});
+  broadcastGameState(code);
+  return true;
+}
+
+async function settleWinner(code) {
+  const game=games[code];
+  if (!game || game.poolSettled || game.settlementPending || !game.winnerPlayerId || game.splitFinalized) return;
+  game.settlementPending=true;
+  try {
+    const winner=game.players.find(p=>p.playerId===game.winnerPlayerId);
+    const tokens=safePoolAmount(game);
+    if (!winner) throw new Error('Winner wallet is not available.');
+    if (tokens>0) {
+      const wallet=await loadPrizeWallet();
+      await wallet.settlePool(wallet.walletDb(),{matchId:game.matchId,kind:'winner',awards:[{uid:winner.walletUid,playerId:winner.playerId,tokens}],
+        assertEligible:()=>{if(games[code]!==game || game.state!=='finished' || game.winnerPlayerId!==winner.playerId || game.splitFinalized) throw new Error('Winner changed before settlement.')}});
+    }
+    game.poolSettled=true;
+    game.prizeResult={kind:'winner',poolAmount:tokens,awards:[{playerId:winner.playerId,tokens}],settled:true};
+    game.settlementError=null;
+  } catch(error) { game.settlementError=error.message || 'Wallet settlement is unavailable. No prize success is confirmed.'; }
+  finally { game.settlementPending=false; broadcastGameState(code); }
+}
+
+async function finalizeSplit(code) {
   const game = games[code];
-  if (!game || game.splitFinalized) return false;
+  if (!game || game.splitFinalized || game.settlementPending || !game.splitProposal) return false;
   const offer = buildSplitOffer(game);
   if (!offer) return false;
   const confirmed = game.splitConfirmedPlayerIds || new Set();
   if (!offer.playerIds.every((playerId) => confirmed.has(playerId))) return false;
+  if (!game.splitProposal.locked && !offer.players.every(p=>p.connected)) return false;
+  if (!game.splitProposal.locked && offer.endsAt <= Date.now()) { cancelSplit(code,'Split expired. The match continues.'); return false; }
+  const proposal=game.splitProposal;
+  // Once unanimous agreement locks settlement, a network/credential error
+  // must not resume gameplay: an ambiguous commit can only be retried using
+  // the same persistent pool ID and allocation.
+  proposal.locked=true;
+  game.settlementPending=true;
+  clearTimeout(proposal.timer);
+  try {
+    if (offer.poolAmount > 0) {
+      const wallet=await loadPrizeWallet();
+      const awards=offer.players.map(p=>({uid:game.players.find(x=>x.playerId===p.playerId)?.walletUid,playerId:p.playerId,tokens:p.tokens}));
+      await wallet.settlePool(wallet.walletDb(),{matchId:game.matchId,kind:'split',awards,assertEligible:()=>{
+        if(games[code]!==game || game.splitProposal!==proposal || game.state!=='round_over') throw new Error('Split changed before settlement.');
+      }});
+    }
+  } catch(error) {
+    game.settlementPending=false;
+    game.settlementError=error.message || 'Wallet settlement failed. Tokens were not confirmed.';
+    io.to(code).emit('split_update',{code,splitOffer:buildSplitOffer(game)});
+    broadcastGameState(code);
+    return false;
+  }
 
   if (game.nextRoundTimer) {
     clearTimeout(game.nextRoundTimer);
     game.nextRoundTimer = null;
   }
   game.splitFinalized = true;
+  game.poolSettled=true;
+  game.settlementPending=false;
+  game.settlementError=null;
+  game.splitProposal=null;
   game.state = 'finished';
   game.winnerPlayerId = null;
   game.splitResult = {
+    playerCount:offer.playerCount, method:offer.method, precision:offer.precision,
     poolAmount: offer.poolAmount,
-    shareAmount: offer.shareAmount,
+    sharesByPlayerId:offer.sharesByPlayerId,
+    players:offer.players,
+    status:'SPLIT_COMPLETED', settled:true,
     playerIds: [...offer.playerIds],
     finalizedAt: Date.now(),
   };
@@ -1621,14 +1841,14 @@ function finalizeSplit(code) {
     roundNumber: game.roundNumber || 1,
     finalizedAt: Date.now(),
     poolAmount: offer.poolAmount,
-    shareAmount: offer.shareAmount,
+    sharesByPlayerId:offer.sharesByPlayerId,
     playerIds: [...offer.playerIds],
   });
 
   io.to(code).emit('split_finalized', { code, ...game.splitResult });
   game.lastRoundDetails = {
     reason: 'split_finalized',
-    message: `Pool split confirmed. Each remaining player receives ${offer.shareAmount}.`,
+    message: 'All players agreed. The funded token pool has been distributed successfully.',
     roundWinnerPlayerId: game.roundWinnerPlayerId || null,
   };
   for (const player of game.players) {
@@ -1661,6 +1881,7 @@ function removePlayerAfterGrace(code, playerId) {
   // Keep disconnected hands for authoritative timeout scoring and the result
   // snapshot. Leaving cannot remove a hand or terminate this window early.
   const pendingGame = games[code];
+  if(pendingGame?.settlementPending || pendingGame?.splitProposal?.locked){const key=timerKey(code,playerId);disconnectTimers.set(key,setTimeout(()=>removePlayerAfterGrace(code,playerId),1000));return;}
   player.hasLeft = true;
   player.isActive = false;
   const exitingGamePlayer = pendingGame?.players.find(p => p.playerId === playerId);
@@ -1669,6 +1890,7 @@ function removePlayerAfterGrace(code, playerId) {
     exitingGamePlayer.isActive = false;
     exitingGamePlayer.permanentlyDisconnected = true;
     syncDealerCrown(pendingGame);
+    if(pendingGame.splitProposal)cancelSplit(code,'A split participant permanently left. The match continues.');
   }
   if (pendingGame?.state === 'score_window' && pendingGame.scoreWindowStage === 'score') {
     const key = timerKey(code, playerId);
@@ -1760,6 +1982,7 @@ function clearSeatingChoiceTimer(room) {
 function cancelPendingSeating(code, message = 'Seating draw cancelled.') {
   const room = rooms[code];
   if (!room) return;
+  if(room.fundingConfirmed && !games[code])void refundRoomFunding(code,room);
   clearSeatingChoiceTimer(room);
   room.pendingSeatingOrder = null;
   room.seatChoiceRequiredPlayerId = null;
@@ -1773,6 +1996,18 @@ function cancelPendingSeating(code, message = 'Seating draw cancelled.') {
   }
   emitRoomUpdate(code);
   io.to(code).emit('game_error', { message });
+}
+
+async function refundRoomFunding(code,room) {
+  if(room.refundPending)return;
+  room.refundPending=true;room.fundingPending=true;
+  try {
+    const wallet=await loadPrizeWallet();
+    await wallet.refundUnstartedPool(wallet.walletDb(),room.fundingMatchId);
+    room.fundingMatchId=null;room.fundingConfirmed=false;
+    io.to(code).emit('game_error',{message:'Starting sequence cancelled. Entry fees were refunded; expired monthly tokens remain expired.'});
+  } catch(error) {io.to(code).emit('game_error',{message:`Entry refund pending: ${error.message}`});}
+  finally {room.fundingPending=false;room.refundPending=false;}
 }
 
 function clearStartSequenceTimers(room) {
@@ -1801,7 +2036,10 @@ function makeInitialGame(currentRoom, players) {
   const initialDealerIndex = players.findIndex((p) => p.playerId === currentRoom.initialDealerPlayerId);
   return {
     players,
-    matchId: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    matchId: currentRoom.fundingMatchId || `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    originTableSize:normaliseTableSize(currentRoom.tableSize),
+    splitRules:normalizeSplitRules(currentRoom.splitRules),
+    splitRequestCount:0, splitRequestCountsByCount:{}, autoSplitShownKeys:new Set(), splitProposal:null, poolSettled:false, settlementPending:false, settlementError:null,
     entryFee: Math.max(0, Math.floor(Number(currentRoom.entryFee) || 0)),
     rejoinCountByPlayerId: {},
     rejoinedWaitingPlayerIds: new Set(),
@@ -2163,17 +2401,36 @@ function scheduleGameStart(code) {
 }
 
 app.get('/', (req, res) => {
-  res.json({ ok: true, service: 'Star Rummy multiplayer', version: '1.7.29', playScoreLimit: 101, rejoinLockScore: 79, maxRejoins: 1, rooms: Object.keys(rooms).length });
+  res.json({ ok: true, service: 'Star Rummy multiplayer', version: '1.7.32', playBillingConfigured: billingConfigured(), playScoreLimit: 101, rejoinLockScore: 79, maxRejoins: 1, autoDropMissedTurns: autoDropThreshold(), rooms: Object.keys(rooms).length });
 });
 
 io.on('connection', (socket) => {
   console.log(`[connect] socket.id=${socket.id}`);
+  socket.on('play_billing_status', (_payload, ack) => ack?.({ok:true,enabled:billingConfigured()}));
+  socket.on('verify_play_purchase', async (payload = {}, ack) => {
+    if (!billingConfigured()) { ack?.({ok:false,message:'Google Play purchases are not configured on the server.'}); return; }
+    if (Date.now() - (socket.playPurchaseWindow || 0) > 60000) { socket.playPurchaseWindow = Date.now(); socket.playPurchaseCount = 0; }
+    if (socket.playPurchaseBusy || (socket.playPurchaseCount || 0) >= 10) { ack?.({ok:false,message:'Purchase verification is already in progress or too many attempts were made. Retry shortly.'}); return; }
+    socket.playPurchaseCount = (socket.playPurchaseCount || 0) + 1;
+    socket.playPurchaseBusy = true;
+    try {
+      const identity = await loadRejoinWallet();
+      const uid = await identity.verifyWalletIdentity(payload.idToken);
+      const wallet = await import('./server/prizeWallet.js');
+      const result = await verifyAndCreditPlayPurchase(wallet.walletDb(), {uid, productId:payload.productId, token:payload.token});
+      ack?.({ok:true,tokens:result.tokens,alreadyCredited:!!result.alreadyCredited,consumptionPending:result.consumptionPending});
+    } catch {
+      // Never expose a Google API error URL: it can contain a purchase token.
+      ack?.({ok:false,message:'Purchase verification could not finish. Check your connection and use Restore purchases, or contact support. Do not purchase the same pack again yet.'});
+    } finally { socket.playPurchaseBusy = false; }
+  });
 
   socket.on('register_room', withWalletIdentity(socket, (payload = {}, ack) => {
     const code = normaliseCode(payload.code);
     const playerId = String(payload.playerId || '').trim();
     const playerName = String(payload.playerName || 'Host').trim().slice(0, 40) || 'Host';
-    const entryFee = Math.max(0, Number(payload.entryFee) || 0);
+    const entryFee = Math.max(0, Math.floor(Number(payload.entryFee) || 0));
+    if(!Number.isSafeInteger(entryFee)){ack?.({ok:false,message:'Invalid token entry fee.'});return;}
     const tableSize = normaliseTableSize(payload.tableSize);
     const minPlayers = normaliseMinPlayers(payload.minPlayers, tableSize);
 
@@ -2306,6 +2563,8 @@ io.on('connection', (socket) => {
       ack?.({ ok: true, code, alreadyLeft: true });
       return;
     }
+    if(player.id!==socket.id){ack?.({ok:false,message:'This seat belongs to another connection.'});return;}
+    if(room.fundingConfirmed && !games[code])void refundRoomFunding(code,room);
 
     clearDisconnectTimer(code, playerId);
     stopActiveGameForExit(code, playerId, player.name, 'player_left');
@@ -2378,7 +2637,7 @@ io.on('connection', (socket) => {
     ack?.({ ok: true, state: game.state });
   });
 
-  socket.on('start_game', (payload = {}, ack) => {
+  socket.on('start_game', async (payload = {}, ack) => {
     const code = normaliseCode(payload.code);
     const playerId = String(payload.playerId || '').trim();
     const room = rooms[code];
@@ -2391,9 +2650,7 @@ io.on('connection', (socket) => {
     }
 
     const hostPlayer = room.players.find((p) => p.playerId === playerId);
-    if (hostPlayer) bindPlayerSocket(code, hostPlayer, socket);
-
-    if (!playerId || playerId !== room.hostPlayerId) {
+    if (!playerId || playerId !== room.hostPlayerId || hostPlayer?.id !== socket.id) {
       const response = { ok: false, message: 'Only the host can start the game.' };
       socket.emit('game_error', response);
       ack?.(response);
@@ -2416,10 +2673,32 @@ io.on('connection', (socket) => {
       return;
     }
 
-    if (room.gameStartScheduled) {
+    if (room.gameStartScheduled || room.fundingPending) {
       ack?.({ ok: true, code, alreadyStarting: true, countdown: START_COUNTDOWN_SECONDS });
       return;
     }
+
+    room.fundingPending=true;
+    try {
+      if (room.entryFee>0 || process.env.FIREBASE_SERVICE_ACCOUNT_JSON || process.env.GOOGLE_APPLICATION_CREDENTIALS) {
+        const wallet=await loadPrizeWallet();
+        room.splitRules=await wallet.loadPrizeRules();
+        if (room.entryFee>0) {
+          room.fundingMatchId ||= `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+          await wallet.fundPool(wallet.walletDb(),{matchId:room.fundingMatchId,members:connectedPlayers.map(p=>({uid:p.walletUid,playerId:p.playerId})),
+            fee:Math.floor(room.entryFee),rules:room.splitRules,assertEligible:()=>{
+              if(rooms[code]!==room || connectedPlayers.some(p=>!p.connected || !room.players.includes(p))) throw new Error('Players changed before pool funding. No entry fees were charged.');
+            }});
+          room.fundingConfirmed=true;
+          if(rooms[code]!==room || connectedPlayers.some(p=>!p.connected || !room.players.includes(p))){await refundRoomFunding(code,room);throw new Error('Starting players changed; funded entry fees were refunded.');}
+        }
+      } else room.splitRules=normalizeSplitRules();
+    } catch(error) {
+      room.fundingPending=false;
+      ack?.({ok:false,message:`Token pool could not be funded: ${error.message || 'Configure the Railway Firebase wallet credential.'}`});
+      return;
+    }
+    room.fundingPending=false;
 
     // Create the complete server-authoritative selection result once. Nothing
     // is broadcast yet: clients first see the locked 3 → 2 → 1 countdown.
@@ -2470,6 +2749,8 @@ io.on('connection', (socket) => {
       return;
     }
 
+    const turnResponse = validateDropTurnRequest(code, game, payload);
+    if (turnResponse) { ack?.(turnResponse); return; }
     actor.id = socket.id;
     actor.connected = true;
     const hand = game.handsByPlayerId[actor.playerId] || [];
@@ -2559,6 +2840,8 @@ io.on('connection', (socket) => {
       return;
     }
 
+    const turnResponse = validateDropTurnRequest(code, game, payload);
+    if (turnResponse) { ack?.(turnResponse); return; }
     actor.id = socket.id;
     actor.connected = true;
     const hand = game.handsByPlayerId[actor.playerId] || [];
@@ -2592,6 +2875,13 @@ io.on('connection', (socket) => {
       ack?.(response);
       return;
     }
+    // A completed manual turn breaks a consecutive-miss streak. The draw
+    // half of an automatic turn does not start a fresh timer or count twice.
+    if (!game.dropTurnClock?.missed) {
+      game.missedTurnsByPlayerId ||= {};
+      game.missedTurnsByPlayerId[actor.playerId] = 0;
+    }
+    clearDropTurnClock(game);
     game.turnIndex = nextTurnIndex;
     broadcastGameState(code);
     ack?.({ ok: true, nextTurnPlayerId: game.players[game.turnIndex]?.playerId || null });
@@ -2618,43 +2908,11 @@ io.on('connection', (socket) => {
       return;
     }
 
-    const hand = game.handsByPlayerId[actor.playerId] || [];
-    if (hand.length !== 13 && hand.length !== 14) {
-      const response = { ok: false, message: 'Your hand is not in a droppable state.' };
-      socket.emit('game_error', response);
-      ack?.(response);
-      return;
-    }
-
-    const penalty = game.drawnPlayerIds.has(actor.playerId) ? 40 : 20;
-    addPoints(game, actor.playerId, penalty);
-    game.droppedPlayerIds.add(actor.playerId);
-    game.initialOpenJokerAvailable = false;
-    io.to(code).emit('player_dropped', { code, playerId: actor.playerId, penalty });
-
-    const stillPlaying = activeRoundPlayers(game);
-    if (stillPlaying.length <= 1) {
-      finishRound(code, {
-        reason: 'last_player_after_drop',
-        roundWinnerPlayerId: stillPlaying[0]?.playerId || null,
-        message: stillPlaying.length === 1
-          ? `${stillPlaying[0].name} wins the round after the other players dropped.`
-          : 'Round ended because no active players remain.',
-      });
-      ack?.({ ok: true, penalty, roundOver: true });
-      return;
-    }
-
-    const nextTurnIndex = nextPlayableIndex(game, game.turnIndex);
-    if (nextTurnIndex < 0) {
-      finishRound(code, { reason: 'no_connected_players', message: 'Round paused because no active player is connected.' });
-      ack?.({ ok: true, penalty, roundOver: true });
-      return;
-    }
-
-    game.turnIndex = nextTurnIndex;
-    broadcastGameState(code);
-    ack?.({ ok: true, penalty, roundOver: false, nextTurnPlayerId: game.players[game.turnIndex]?.playerId || null });
+    // New clients bind confirmation to the displayed round/turn. Older
+    // clients may omit metadata, but can never choose the penalty themselves.
+    const turnResponse = validateDropTurnRequest(code, game, payload);
+    if (turnResponse) { ack?.(turnResponse); return; }
+    ack?.(applyRoundDrop(code, game, actor));
   });
 
   const handleBeginDeclaration = (payload = {}, ack) => {
@@ -2737,11 +2995,37 @@ io.on('connection', (socket) => {
     ack?.({ ok: true });
   });
 
-  socket.on('confirm_split', (payload = {}, ack) => {
+  socket.on('request_split', (payload = {}, ack) => {
+    const code=normaliseCode(payload.code),game=games[code];
+    if (!game) { ack?.({ok:false,message:'Game not found.'}); return; }
+    const actor=findGamePlayer(game,String(payload.playerId || ''),socket.id);
+    const offer=buildSplitOffer(game);
+    if (!actor || !offer || !offer.playerIds.includes(actor.playerId)) { ack?.({ok:false,message:'Split is not eligible, or a rejoin is still pending.'}); return; }
+    if (!game.splitProposal) {
+      if (!normalizeSplitRules(game.splitRules).manualButton) { ack?.({ok:false,message:'Manual split requests are disabled for this table.'}); return; }
+      createSplitProposal(code, game, offer);
+    }
+    const updated=buildSplitOffer(game);
+    if(game.splitProposal && !game.settlementPending && game.splitProposal.players.some(p=>!eligibleRolePlayers(game).some(x=>x.playerId===p.playerId))){cancelSplit(code,'An eligible seat left. The match continues.');ack?.({ok:false});return;}
+    io.to(code).emit('split_update',{code,splitOffer:updated});
+    broadcastGameState(code);
+    ack?.({ok:true,splitOffer:updated});
+  });
+
+  socket.on('decline_split', (payload = {}, ack) => {
+    const code=normaliseCode(payload.code),game=games[code];
+    const actor=game && findGamePlayer(game,String(payload.playerId || ''),socket.id);
+    if (!actor || !game.splitProposal?.players.some(p=>p.playerId===actor.playerId) || payload.proposalId!==game.splitProposal.id || game.settlementPending || game.splitProposal.locked) {
+      ack?.({ok:false,message:'This split vote is no longer available.'}); return;
+    }
+    cancelSplit(code); ack?.({ok:true});
+  });
+
+  socket.on('confirm_split', async (payload = {}, ack) => {
     const code = normaliseCode(payload.code);
     const playerId = String(payload.playerId || '').trim();
     const game = games[code];
-    if (!game || game.state !== 'round_over' || game.splitFinalized || game.rejoinPaymentsPending) {
+    if (!game || game.state !== 'round_over' || game.splitFinalized || game.rejoinPaymentsPending || game.settlementPending || !game.splitProposal || payload.proposalId!==game.splitProposal.id) {
       ack?.({ ok: false, message: 'Split is not available right now.' });
       return;
     }
@@ -2751,12 +3035,22 @@ io.on('connection', (socket) => {
       ack?.({ ok: false, message: 'You are not eligible for this split.' });
       return;
     }
+    if (!game.splitProposal.locked && (game.splitProposal.endsAt<=Date.now() || game.splitProposal.players.some(p=>!eligibleRolePlayers(game).some(x=>x.playerId===p.playerId)))) {
+      cancelSplit(code,'Split expired or eligible seats changed. The match continues.');
+      ack?.({ok:false,message:'This proposal has expired.'}); return;
+    }
     game.splitConfirmedPlayerIds = game.splitConfirmedPlayerIds || new Set();
     game.splitConfirmedPlayerIds.add(actor.playerId);
     const updated = buildSplitOffer(game);
     io.to(code).emit('split_update', { code, splitOffer: updated });
-    const finalized = finalizeSplit(code);
+    const finalized = await finalizeSplit(code);
     ack?.({ ok: true, finalized, splitOffer: finalized ? null : updated, splitResult: game.splitResult || null });
+  });
+
+  socket.on('retry_prize_settlement', async (payload={},ack)=>{
+    const code=normaliseCode(payload.code),game=games[code];
+    if (!game || !findGamePlayer(game,String(payload.playerId || ''),socket.id) || game.state!=='finished' || game.splitFinalized) {ack?.({ok:false});return;}
+    await settleWinner(code);ack?.({ok:game.poolSettled,error:game.settlementError});
   });
 
   socket.on('start_next_round', (payload = {}, ack) => {
@@ -2789,7 +3083,7 @@ io.on('connection', (socket) => {
       ack?.({ ok: false, message: 'The next round is not ready yet.' });
       return;
     }
-    if (game.rejoinPaymentsPending || (game.rejoinEndsAt && Date.now() < game.rejoinEndsAt && game.rejoinCandidatePlayerIds?.length)) {
+    if (game.rejoinPaymentsPending || game.splitProposal || game.settlementPending || (game.rejoinEndsAt && Date.now() < game.rejoinEndsAt && game.rejoinCandidatePlayerIds?.length)) {
       ack?.({ ok: false, message: 'Wait for the current rejoin window to close.', rejoinEndsAt: game.rejoinEndsAt });
       return;
     }
