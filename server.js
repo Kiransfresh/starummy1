@@ -47,7 +47,8 @@ function canTakeInitialOpenJoker(game, playerId) {
 function ruleCardPoints(card, wildJoker = null) {
   if (!card || ruleIsJokerCard(card, wildJoker)) return 0;
   if (RULE_HIGH_CARDS.has(String(card.rank))) return 10;
-  return Math.max(0, Number(card.pts ?? card.value ?? card.rank) || 0);
+  const rank = Number(card.rank);
+  return Number.isInteger(rank) && rank >= 2 && rank <= 9 ? rank : 0;
 }
 
 function ruleRankNumber(rank, aceHigh = false) {
@@ -148,6 +149,15 @@ function ruleBuildMeldIndex(hand, melds) {
 function validate101Declaration(hand, wildJoker = null) {
   if (!Array.isArray(hand) || hand.length !== 13) {
     return { valid: false, reason: 'A declaration must contain exactly 13 cards.' };
+  }
+
+  const ids = hand.filter(card => card?.id != null).map(card => String(card.id));
+  if (new Set(ids).size !== ids.length) return { valid: false, reason: 'Every physical card must be accounted for exactly once.' };
+  const copies = new Map();
+  for (const card of hand) {
+    const key = ruleIsPrintedJoker(card) ? 'printed' : `${card.rank}:${card.suit}`;
+    copies.set(key, (copies.get(key) || 0) + 1);
+    if (copies.get(key) > (key === 'printed' ? 4 : 2)) return { valid: false, reason: 'This hand contains more card copies than the two decks allow.' };
   }
 
   const melds = ruleEnumerateMelds(hand, wildJoker);
@@ -306,6 +316,8 @@ const SCORE_WINDOW_SECONDS = 30;
 const TURN_MAIN_SECONDS = 60;
 const TURN_EXTRA_SECONDS = 30;
 const ROUND_RESULT_SECONDS = 8;
+const REJOIN_LOCK_SCORE = 79;
+const MAX_REJOINS_PER_MATCH = 1;
 const SPLIT_COUNTS = new Set([2, 3]);
 
 function normaliseTableSize(value) {
@@ -603,15 +615,102 @@ function eligibleRolePlayers(game) {
 }
 
 function rejoinCandidates(game) {
+  if (!game || game.state === 'finished' || game.splitFinalized) return [];
   const survivors = eligibleRolePlayers(game);
-  if (!survivors.length || survivors.some((player) => (game.scoresByPlayerId[player.playerId] || 0) >= 80)) return [];
+  if (!survivors.length || survivors.some((player) => (game.scoresByPlayerId[player.playerId] || 0) >= REJOIN_LOCK_SCORE)) return [];
   return game.players.filter(player => isEliminated(game, player.playerId)
+    && Number(game.rejoinCountByPlayerId?.[player.playerId] || 0) < MAX_REJOINS_PER_MATCH
+    && !game.rejoinDeclinedPlayerIds?.has(player.playerId)
     && player.isActive !== false && player.seatActive !== false
     && !player.hasLeft && !player.removed && !player.permanentlyDisconnected).map(player => player.playerId);
 }
 
 function rejoinStartingScore(game) {
   return Math.max(...eligibleRolePlayers(game).map((player) => game.scoresByPlayerId[player.playerId] || 0), 0) + 1;
+}
+
+function rejoinPlayerStatus(game, player) {
+  if (player.hasLeft || player.removed || player.permanentlyDisconnected || player.isActive === false) return 'left';
+  if (game.rejoinedWaitingPlayerIds?.has(player.playerId)) return 'rejoined_waiting';
+  if (isEliminated(game, player.playerId)) return rejoinCandidates(game).includes(player.playerId) ? 'rejoin_pending' : 'eliminated';
+  if (player.connected === false) return 'disconnected';
+  return game.droppedPlayerIds.has(player.playerId) ? 'dropped' : 'active';
+}
+
+function rejoinOfferFor(game, playerId) {
+  const player = game.players.find(p => p.playerId === playerId);
+  const count = Number(game.rejoinCountByPlayerId?.[playerId] || 0);
+  let reason = '';
+  if (game.state === 'finished' || game.splitFinalized) reason = 'This match is complete.';
+  else if (!player || player.hasLeft || player.removed || player.permanentlyDisconnected || player.isActive === false) reason = 'This seat has permanently left the table.';
+  else if (count >= MAX_REJOINS_PER_MATCH) reason = 'Your one rejoin opportunity has already been used.';
+  else if (game.rejoinDeclinedPlayerIds?.has(playerId)) reason = 'You declined this rejoin opportunity.';
+  else if (game.state !== 'round_over' || !game.rejoinEndsAt || Date.now() >= game.rejoinEndsAt) reason = 'The between-round rejoin window is closed.';
+  else if (!isEliminated(game, playerId)) reason = 'You are not eliminated.';
+  else if (!rejoinCandidates(game).includes(playerId)) reason = 'Every remaining active player must be below 79 points.';
+  return { available: !reason, reason, currentScore: Number(game.scoresByPlayerId[playerId] || 0),
+    score: reason ? null : rejoinStartingScore(game), fee: game.entryFee || 0,
+    remaining: Math.max(0, MAX_REJOINS_PER_MATCH - count), endsAt: game.rejoinEndsAt || null,
+    status: player ? rejoinPlayerStatus(game, player) : 'left' };
+}
+
+async function loadRejoinWallet() { return import('./server/rejoinWallet.js'); }
+
+function withWalletIdentity(socket, handler) {
+  return (payload = {}, ack) => {
+    if (!payload.idToken) {
+      const player = rooms[normaliseCode(payload.code)]?.players.find(p => p.playerId === payload.playerId);
+      if (player?.walletUid) { ack?.({ ok: false, message: 'Sign in again to restore this table.' }); return; }
+      socket.walletUid = null;
+      return handler(payload, ack);
+    }
+    return loadRejoinWallet().then(wallet => wallet.verifyWalletIdentity(payload.idToken)).then(uid => {
+      const player = rooms[normaliseCode(payload.code)]?.players.find(p => p.playerId === payload.playerId);
+      if (player?.walletUid && player.walletUid !== uid) throw new Error('This table seat belongs to a different account.');
+      socket.walletUid = uid;
+      return handler(payload, ack);
+    }).catch(() => ack?.({ ok: false, message: 'Unable to verify your table identity. Please sign in again.' }));
+  };
+}
+
+function confirmRejoinState(code, game, actor, score, receipt = null) {
+  game.rejoinCountByPlayerId ||= {};
+  game.rejoinedWaitingPlayerIds ||= new Set();
+  game.confirmedRejoinsByPlayerId ||= {};
+  game.rejoinCountByPlayerId[actor.playerId] = 1;
+  game.scoresByPlayerId[actor.playerId] = score;
+  game.rejoinedWaitingPlayerIds.add(actor.playerId);
+  const response = { ok: true, startingScore: score, fee: game.entryFee || 0,
+    status: 'rejoined_waiting', roundNumber: game.roundNumber, balanceAfter: receipt?.balanceAfter };
+  game.confirmedRejoinsByPlayerId[actor.playerId] = response;
+  if (receipt) game.poolAmount = receipt.poolAfter;
+  game.rejoinCandidatePlayerIds = rejoinCandidates(game);
+  // Role selection is deferred to the EXISTING next-round transition.
+  // No crown animation, Big Card draw or dealer rotation happens on confirmation.
+  io.to(code).emit('player_rejoined_game', { code, playerId: actor.playerId, ...response });
+  broadcastGameState(code);
+  return response;
+}
+
+async function confirmPaidRejoin(code, game, actor, idToken) {
+  const wallet = await loadRejoinWallet();
+  const uid = await wallet.verifyWalletIdentity(idToken);
+  if (!actor.walletUid || uid !== actor.walletUid) throw new Error('Rejoin requires the same account that joined this table.');
+  const assertEligible = () => {
+    if (games[code] !== game || !rejoinOfferFor(game, actor.playerId).available) throw new Error('This rejoin window has closed or eligibility changed.');
+  };
+  assertEligible();
+  const details = { uid, matchId: game.matchId, playerId: actor.playerId, fee: game.entryFee,
+    score: rejoinStartingScore(game), roundNumber: game.roundNumber,
+    poolAfter: safePoolAmount(game) + game.entryFee, assertEligible };
+  const receipt = await wallet.chargeRejoinTokens(details);
+  // A socket disconnect is temporary, not a failure. A permanent exit after
+  // committing is rolled back, without reactivating a left seat.
+  if (games[code] !== game || game.state !== 'round_over' || actor.hasLeft || actor.permanentlyDisconnected || actor.isActive === false) {
+    await wallet.refundRejoinTokens(details);
+    throw new Error('Rejoin was cancelled; the token fee was refunded.');
+  }
+  return confirmRejoinState(code, game, actor, receipt.score, receipt);
 }
 
 // Preserve the ORIGINAL next-lower card distributor rotation for the session.
@@ -741,9 +840,13 @@ function roundHistoryEntry(game, details = {}) {
 }
 
 function addPoints(game, playerId, points) {
+  game.scoredPlayerIds ||= new Set();
+  if (game.scoredPlayerIds.has(playerId)) return false;
   const safePoints = Math.max(0, Math.min(80, Number(points) || 0));
   game.scoresByPlayerId[playerId] = (game.scoresByPlayerId[playerId] || 0) + safePoints;
   game.roundPointsByPlayerId[playerId] = (game.roundPointsByPlayerId[playerId] || 0) + safePoints;
+  game.scoredPlayerIds.add(playerId);
+  return true;
 }
 
 function dealRound(game, incrementRound = true) {
@@ -794,6 +897,9 @@ function dealRound(game, incrementRound = true) {
   game.wildJoker = wildJoker;
   game.droppedPlayerIds = new Set();
   game.drawnPlayerIds = new Set();
+  game.scoredPlayerIds = new Set();
+  game.rejoinedWaitingPlayerIds = new Set();
+  game.rejoinDeclinedPlayerIds = new Set();
   if (!game.lastRoundPointsByPlayerId) {
     game.lastRoundPointsByPlayerId = Object.fromEntries(game.players.map((player) => [player.playerId, 0]));
   }
@@ -961,6 +1067,8 @@ function buildSnapshot(game, forPlayerId) {
     discardHistory: [...(game.discardHistoryByPlayerId?.[p.playerId] || [])],
     dropped: game.droppedPlayerIds.has(p.playerId),
     isEliminated: isEliminated(game, p.playerId),
+    rejoinCount: Number(game.rejoinCountByPlayerId?.[p.playerId] || 0),
+    playerStatus: rejoinPlayerStatus(game, p),
     scoreSubmitted: game.submittedScorePlayerIds?.has(p.playerId) || false,
   }));
 
@@ -1005,6 +1113,8 @@ function buildSnapshot(game, forPlayerId) {
     rejoinCandidatePlayerIds: game.state === 'round_over' ? [...(game.rejoinCandidatePlayerIds || [])] : [],
     rejoinStartingScore: game.state === 'round_over' && game.rejoinCandidatePlayerIds?.length ? rejoinStartingScore(game) : null,
     rejoinEndsAt: game.rejoinEndsAt || null,
+    rejoinOffer: rejoinOfferFor(game, forPlayerId),
+    rejoinPaymentPending: game.rejoinPaymentsPending > 0,
     roundHistory: [...(game.roundHistory || [])],
     poolAmount: safePoolAmount(game),
     splitOffer: buildSplitOffer(game),
@@ -1053,6 +1163,8 @@ function buildRoundResult(code, game, forPlayerId, details = {}) {
     rejoinCandidatePlayerIds: [...(game.rejoinCandidatePlayerIds || [])],
     rejoinStartingScore: game.rejoinCandidatePlayerIds?.length ? rejoinStartingScore(game) : null,
     rejoinEndsAt: game.rejoinEndsAt || null,
+    rejoinOffer: rejoinOfferFor(game, forPlayerId),
+    rejoinPaymentPending: game.rejoinPaymentsPending > 0,
     declaredPlayerIds: [...(game.declaredPlayerIds || new Set())],
     scoreWindowEndsAt: game.scoreWindowEndsAt || null,
     roundHistory: [...(game.roundHistory || [])],
@@ -1085,6 +1197,8 @@ function buildRoundResult(code, game, forPlayerId, details = {}) {
       lastRoundPoints: game.roundPointsByPlayerId[player.playerId] || 0,
       dropped: game.droppedPlayerIds.has(player.playerId),
       isEliminated: isEliminated(game, player.playerId),
+      rejoinCount: Number(game.rejoinCountByPlayerId?.[player.playerId] || 0),
+      playerStatus: rejoinPlayerStatus(game, player),
       handSize: (game.handsByPlayerId[player.playerId] || []).length,
       lastDiscard: game.lastDiscardByPlayerId?.[player.playerId] || null,
       discardHistory: [...(game.discardHistoryByPlayerId?.[player.playerId] || [])],
@@ -1095,6 +1209,8 @@ function buildRoundResult(code, game, forPlayerId, details = {}) {
 function finishRound(code, details = {}) {
   const game = games[code];
   if (!game) return;
+  if (game.lastFinalizedRoundNumber === game.roundNumber) return;
+  game.lastFinalizedRoundNumber = game.roundNumber;
 
   if (game.scoreWindowTimer) {
     clearTimeout(game.scoreWindowTimer);
@@ -1140,9 +1256,13 @@ function finishRound(code, details = {}) {
   // automatically continue the game if all eligible players do not confirm it.
   // finalizeSplit() clears this timer when a split is accepted unanimously.
   if (game.state === 'round_over') {
-    game.nextRoundTimer = setTimeout(() => {
+    const advanceAfterResults = () => {
       const current = games[code];
       if (!current || current.state !== 'round_over' || current.splitFinalized) return;
+      if (current.rejoinPaymentsPending > 0) {
+        current.nextRoundTimer = setTimeout(advanceAfterResults, 200);
+        return;
+      }
       current.rejoinCandidatePlayerIds = [];
       current.rejoinEndsAt = null;
       if (eligibleRolePlayers(current).length <= 1) {
@@ -1155,7 +1275,8 @@ function finishRound(code, details = {}) {
       dealRound(current);
       io.to(code).emit('round_started', { code, roundNumber: current.roundNumber });
       broadcastGameState(code);
-    }, ROUND_RESULT_SECONDS * 1000);
+    };
+    game.nextRoundTimer = setTimeout(advanceAfterResults, ROUND_RESULT_SECONDS * 1000);
   }
 }
 
@@ -1590,7 +1711,7 @@ function removePlayerAfterGrace(code, playerId) {
             message: 'Round completed because no other active opponent remains.',
           });
         } else {
-          if (game.state === 'round_over' && eligibleRolePlayers(game).length <= 1) {
+          if (game.state === 'round_over' && eligibleRolePlayers(game).length <= 1 && !rejoinCandidates(game).length && !game.rejoinPaymentsPending) {
             game.state = 'finished';
             game.winnerPlayerId = eligibleRolePlayers(game)[0]?.playerId || game.roundWinnerPlayerId || null;
             game.rejoinCandidatePlayerIds = [];
@@ -1680,6 +1801,13 @@ function makeInitialGame(currentRoom, players) {
   const initialDealerIndex = players.findIndex((p) => p.playerId === currentRoom.initialDealerPlayerId);
   return {
     players,
+    matchId: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    entryFee: Math.max(0, Math.floor(Number(currentRoom.entryFee) || 0)),
+    rejoinCountByPlayerId: {},
+    rejoinedWaitingPlayerIds: new Set(),
+    rejoinDeclinedPlayerIds: new Set(),
+    confirmedRejoinsByPlayerId: {},
+    rejoinPaymentsPending: 0,
     scoresByPlayerId: Object.fromEntries(players.map((player) => [player.playerId, 0])),
     roundPointsByPlayerId: {},
     lastRoundPointsByPlayerId: Object.fromEntries(players.map((player) => [player.playerId, 0])),
@@ -2035,13 +2163,13 @@ function scheduleGameStart(code) {
 }
 
 app.get('/', (req, res) => {
-  res.json({ ok: true, service: 'Star Rummy multiplayer', version: '1.7.28', playScoreLimit: 101, rejoinLockScore: 80, rooms: Object.keys(rooms).length });
+  res.json({ ok: true, service: 'Star Rummy multiplayer', version: '1.7.29', playScoreLimit: 101, rejoinLockScore: 79, maxRejoins: 1, rooms: Object.keys(rooms).length });
 });
 
 io.on('connection', (socket) => {
   console.log(`[connect] socket.id=${socket.id}`);
 
-  socket.on('register_room', (payload = {}, ack) => {
+  socket.on('register_room', withWalletIdentity(socket, (payload = {}, ack) => {
     const code = normaliseCode(payload.code);
     const playerId = String(payload.playerId || '').trim();
     const playerName = String(payload.playerName || 'Host').trim().slice(0, 40) || 'Host';
@@ -2067,7 +2195,7 @@ io.on('connection', (socket) => {
 
       let hostPlayer = existing.players.find((p) => p.playerId === playerId);
       if (!hostPlayer) {
-        hostPlayer = { id: socket.id, playerId, name: playerName, connected: true };
+        hostPlayer = { id: socket.id, playerId, name: playerName, connected: true, walletUid: socket.walletUid || null };
         existing.players.unshift(hostPlayer);
       }
       hostPlayer.name = playerName;
@@ -2089,13 +2217,13 @@ io.on('connection', (socket) => {
       entryFee,
       tableSize,
       minPlayers,
-      players: [{ id: socket.id, playerId, name: playerName, connected: true }],
+      players: [{ id: socket.id, playerId, name: playerName, connected: true, walletUid: socket.walletUid || null }],
     };
     socket.join(code);
     socket.emit('room_registered', { code, resumed: false });
     emitRoomUpdate(code);
     ack?.({ ok: true, code, resumed: false, hostPlayerId: rooms[code].hostPlayerId || null, entryFee: rooms[code].entryFee || 0, tableSize, minPlayers, players: publicPlayers(rooms[code].players) });
-  });
+  }));
 
   socket.on('validate_room', (payload = {}, ack) => {
     const code = normaliseCode(payload.code);
@@ -2107,7 +2235,7 @@ io.on('connection', (socket) => {
     ack?.({ ok: true, ...response });
   });
 
-  socket.on('join_room', (payload = {}, ack) => {
+  socket.on('join_room', withWalletIdentity(socket, (payload = {}, ack) => {
     const code = normaliseCode(payload.code);
     const playerId = String(payload.playerId || '').trim();
     const playerName = String(payload.playerName || 'Player').trim().slice(0, 40) || 'Player';
@@ -2153,7 +2281,7 @@ io.on('connection', (socket) => {
     }
 
     if (!player) {
-      player = { id: socket.id, playerId, name: playerName, connected: true };
+      player = { id: socket.id, playerId, name: playerName, connected: true, walletUid: socket.walletUid || null };
       room.players.push(player);
     } else {
       player.name = playerName;
@@ -2166,7 +2294,7 @@ io.on('connection', (socket) => {
     restoreStartOrGameState(code, room, player, socket);
 
     ack?.({ ok: true, code, hostPlayerId: room.hostPlayerId || null, entryFee: room.entryFee || 0, tableSize: normaliseTableSize(room.tableSize), minPlayers: normaliseMinPlayers(room.minPlayers, room.tableSize), players: publicPlayers(room.players), resumed: !!games[code] });
-  });
+  }));
 
   socket.on('leave_room', (payload = {}, ack) => {
     const code = normaliseCode(payload.code);
@@ -2192,7 +2320,7 @@ io.on('connection', (socket) => {
     ack?.({ ok: true, code });
   });
 
-  socket.on('rejoin_room', (payload = {}, ack) => {
+  socket.on('rejoin_room', withWalletIdentity(socket, (payload = {}, ack) => {
     const code = normaliseCode(payload.code);
     const playerId = String(payload.playerId || '').trim();
     const room = rooms[code];
@@ -2211,7 +2339,7 @@ io.on('connection', (socket) => {
 
     socket.emit('room_rejoined', { code });
     ack?.({ ok: true, code, inGame: restored.inGame, startPhase: room.startSequence?.phase || null });
-  });
+  }));
 
   socket.on('request_game_state', (payload = {}, ack) => {
     const code = normaliseCode(payload.code);
@@ -2566,26 +2694,54 @@ io.on('connection', (socket) => {
     const code = normaliseCode(payload.code);
     const game = games[code];
     const actor = findGamePlayer(game, String(payload.playerId || '').trim(), socket.id);
+    if (!game || game.state === 'finished' || game.splitFinalized || actor?.hasLeft || actor?.permanentlyDisconnected) {
+      ack?.({ ok: false, message: 'This match or table seat is no longer available.' }); return;
+    }
+    if (actor && !isEliminated(game, actor.playerId) && game.confirmedRejoinsByPlayerId?.[actor.playerId]) {
+      ack?.({ ...game.confirmedRejoinsByPlayerId[actor.playerId], alreadyConfirmed: true });
+      return;
+    }
     if (!game || !actor || actor.hasLeft || actor.isActive === false || actor.permanentlyDisconnected
       || game.state !== 'round_over' || !game.rejoinEndsAt || Date.now() >= game.rejoinEndsAt
       || !game.rejoinCandidatePlayerIds?.includes(actor.playerId) || !rejoinCandidates(game).includes(actor.playerId)) {
       ack?.({ ok: false, message: 'Rejoin is not available for this player or this round.' });
       return;
     }
-    const startingScore = rejoinStartingScore(game);
-    game.scoresByPlayerId[actor.playerId] = startingScore;
+    if (!game.entryFee) { ack?.(confirmRejoinState(code, game, actor, rejoinStartingScore(game))); return; }
+    game.rejoinPaymentsPending += 1;
+    // Serialize fee-bearing rejoin confirmations per table. A second player's
+    // new score is calculated AFTER the first confirmed transaction.
+    game.rejoinQueue = (game.rejoinQueue || Promise.resolve()).then(async () => {
+      if (!isEliminated(game, actor.playerId) && game.confirmedRejoinsByPlayerId?.[actor.playerId]) return game.confirmedRejoinsByPlayerId[actor.playerId];
+      return confirmPaidRejoin(code, game, actor, payload.idToken);
+    }).then(response => ack?.(response)).catch(error => {
+      const message = /Insufficient|window|account|cancelled|opportunity/.test(error.message || '') ? error.message : 'Token wallet verification is unavailable. No rejoin was confirmed. Please contact the administrator.';
+      ack?.({ ok: false, message });
+    }).finally(() => { game.rejoinPaymentsPending -= 1; broadcastGameState(code); });
+  });
+
+  socket.on('decline_rejoin', (payload = {}, ack) => {
+    const code = normaliseCode(payload.code), game = games[code];
+    const actor = findGamePlayer(game, String(payload.playerId || '').trim(), socket.id);
+    if (!actor || game.state !== 'round_over' || game.rejoinPaymentsPending || !isEliminated(game, actor.playerId)) {
+      ack?.({ ok: false, message: 'A pending rejoin cannot be declined right now.' }); return;
+    }
+    game.rejoinDeclinedPlayerIds.add(actor.playerId);
     game.rejoinCandidatePlayerIds = rejoinCandidates(game);
-    syncDealerCrown(game);
-    io.to(code).emit('player_rejoined_game', { code, playerId: actor.playerId, startingScore });
+    if (eligibleRolePlayers(game).length <= 1 && !game.rejoinCandidatePlayerIds.length) {
+      game.state = 'finished'; game.rejoinEndsAt = null;
+      game.winnerPlayerId = eligibleRolePlayers(game)[0]?.playerId || game.roundWinnerPlayerId || null;
+      syncDealerCrown(game);
+    }
     broadcastGameState(code);
-    ack?.({ ok: true, startingScore });
+    ack?.({ ok: true });
   });
 
   socket.on('confirm_split', (payload = {}, ack) => {
     const code = normaliseCode(payload.code);
     const playerId = String(payload.playerId || '').trim();
     const game = games[code];
-    if (!game || game.state !== 'round_over' || game.splitFinalized) {
+    if (!game || game.state !== 'round_over' || game.splitFinalized || game.rejoinPaymentsPending) {
       ack?.({ ok: false, message: 'Split is not available right now.' });
       return;
     }
@@ -2633,7 +2789,7 @@ io.on('connection', (socket) => {
       ack?.({ ok: false, message: 'The next round is not ready yet.' });
       return;
     }
-    if (game.rejoinEndsAt && Date.now() < game.rejoinEndsAt && game.rejoinCandidatePlayerIds?.length) {
+    if (game.rejoinPaymentsPending || (game.rejoinEndsAt && Date.now() < game.rejoinEndsAt && game.rejoinCandidatePlayerIds?.length)) {
       ack?.({ ok: false, message: 'Wait for the current rejoin window to close.', rejoinEndsAt: game.rejoinEndsAt });
       return;
     }
