@@ -1,23 +1,27 @@
 import { createHash } from 'node:crypto'
-import { applicationDefault, cert, getApps, initializeApp } from 'firebase-admin/app'
+import { cert, getApps, initializeApp } from 'firebase-admin/app'
 import { getAuth } from 'firebase-admin/auth'
 import { FieldValue, getFirestore } from 'firebase-admin/firestore'
 import { distributableTokens } from './splitRules.js'
+import { resolveWalletCredential } from './firebaseCredentials.js'
 
 // Token-only wallet. No cash, withdrawals or redeemable prizes are supported.
 export function firebaseApp() {
   const existing = getApps().find(app => app.name === 'rummy-wallet')
   if (existing) return existing
-  const account = process.env.FIREBASE_SERVICE_ACCOUNT_JSON
+  const { projectId, account } = resolveWalletCredential()
   return initializeApp({
-    projectId: process.env.FIREBASE_PROJECT_ID || 'star-rummy-101-ed2b5',
-    credential: account ? cert(JSON.parse(account)) : applicationDefault(),
+    projectId,
+    credential: cert(account),
   }, 'rummy-wallet')
 }
 
 export async function verifyWalletIdentity(idToken) {
   if (typeof idToken !== 'string' || !idToken) throw new Error('Sign in before rejoining a token-entry table.')
-  const decoded = await getAuth(firebaseApp()).verifyIdToken(idToken)
+  // ID-token signature verification uses Firebase public certificates, not a
+  // privileged Firestore key. Free rooms stay usable if wallet setup is missing.
+  const identityApp = getApps().find(app => app.name === 'rummy-identity') || initializeApp({ projectId: process.env.FIREBASE_PROJECT_ID || 'star-rummy-101-ed2b5' }, 'rummy-identity')
+  const decoded = await getAuth(identityApp).verifyIdToken(idToken)
   return decoded.uid
 }
 

@@ -7,7 +7,8 @@
     "node": ">=20"
   },
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "check:wallet": "node server/checkWalletSetup.js"
   },
   "dependencies": {
     "firebase-admin": "^12.7.0",

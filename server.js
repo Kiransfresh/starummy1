@@ -5,6 +5,7 @@ import { Server } from 'socket.io';
 import { normalizeSplitRules, splitEligible, allocateSplitTokens, distributableTokens } from './server/splitRules.js';
 import { publicPagesRouter } from './server/publicPages.js';
 import { billingConfigured, verifyAndCreditPlayPurchase } from './server/playBilling.js';
+import { roomFundingFailure, walletConfigurationStatus } from './server/firebaseCredentials.js';
 
 
 // Railway-safe 101-pool rules. These are intentionally embedded in the
@@ -1431,7 +1432,7 @@ function resumeAfterWrongShow(code, playerId, reason) {
   game.state = 'playing';
   addPoints(game, playerId, 80);
   game.droppedPlayerIds.add(playerId);
-  io.to(code).emit('player_dropped', { code, playerId, penalty: 80, reason });
+  io.to(code).emit('player_dropped', { code, roundNumber: game.roundNumber, playerId, penalty: 80, reason });
   const remaining = activeRoundPlayers(game);
   if (remaining.length <= 1) {
     finishRound(code, { reason, roundWinnerPlayerId: remaining[0]?.playerId || null,
@@ -1533,7 +1534,7 @@ function submitFollowingDeclaration(code, actor, cardId) {
   } else {
     addPoints(game, actor.playerId, 80);
     game.droppedPlayerIds.add(actor.playerId);
-    io.to(code).emit('player_dropped', { code, playerId: actor.playerId, penalty: 80, reason: 'wrong_declaration' });
+    io.to(code).emit('player_dropped', { code, roundNumber: game.roundNumber, playerId: actor.playerId, penalty: 80, reason: 'wrong_declaration' });
   }
   io.to(code).emit('player_declared', { code, roundNumber: game.roundNumber, playerId: actor.playerId,
     valid: verdict.valid, reason: verdict.reason, winnerPlayerId: game.roundWinnerPlayerId,
@@ -2401,7 +2402,7 @@ function scheduleGameStart(code) {
 }
 
 app.get('/', (req, res) => {
-  res.json({ ok: true, service: 'Star Rummy multiplayer', version: '1.7.32', playBillingConfigured: billingConfigured(), playScoreLimit: 101, rejoinLockScore: 79, maxRejoins: 1, autoDropMissedTurns: autoDropThreshold(), rooms: Object.keys(rooms).length });
+  res.json({ ok: true, service: 'Star Rummy multiplayer', version: '1.7.36', walletCredentialsConfigured:walletConfigurationStatus().configured, playBillingConfigured: billingConfigured(), playScoreLimit: 101, rejoinLockScore: 79, maxRejoins: 1, autoDropMissedTurns: autoDropThreshold(), rooms: Object.keys(rooms).length });
 });
 
 io.on('connection', (socket) => {
@@ -2680,7 +2681,7 @@ io.on('connection', (socket) => {
 
     room.fundingPending=true;
     try {
-      if (room.entryFee>0 || process.env.FIREBASE_SERVICE_ACCOUNT_JSON || process.env.GOOGLE_APPLICATION_CREDENTIALS) {
+      if (room.entryFee>0) {
         const wallet=await loadPrizeWallet();
         room.splitRules=await wallet.loadPrizeRules();
         if (room.entryFee>0) {
@@ -2695,7 +2696,7 @@ io.on('connection', (socket) => {
       } else room.splitRules=normalizeSplitRules();
     } catch(error) {
       room.fundingPending=false;
-      ack?.({ok:false,message:`Token pool could not be funded: ${error.message || 'Configure the Railway Firebase wallet credential.'}`});
+      ack?.(roomFundingFailure(error));
       return;
     }
     room.fundingPending=false;
