@@ -18,10 +18,11 @@ export function firebaseApp() {
 
 export async function verifyWalletIdentity(idToken) {
   if (typeof idToken !== 'string' || !idToken) throw new Error('Sign in before rejoining a token-entry table.')
-  // ID-token signature verification uses Firebase public certificates, not a
-  // privileged Firestore key. Free rooms stay usable if wallet setup is missing.
-  const identityApp = getApps().find(app => app.name === 'rummy-identity') || initializeApp({ projectId: process.env.FIREBASE_PROJECT_ID || 'star-rummy-101-ed2b5' }, 'rummy-identity')
-  const decoded = await getAuth(identityApp).verifyIdToken(idToken)
+  // Reuse the explicitly validated JSON credential. An implicit default app
+  // consults GOOGLE_APPLICATION_CREDENTIALS even when JSON is configured,
+  // which can point to a Windows path that does not exist in Railway's container.
+  // Firebase still verifies the token signature, issuer, audience and expiry.
+  const decoded = await getAuth(firebaseApp()).verifyIdToken(idToken)
   return decoded.uid
 }
 

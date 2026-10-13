@@ -6,6 +6,7 @@ import { normalizeSplitRules, splitEligible, allocateSplitTokens, distributableT
 import { publicPagesRouter } from './server/publicPages.js';
 import { billingConfigured, verifyAndCreditPlayPurchase } from './server/playBilling.js';
 import { roomFundingFailure, walletConfigurationStatus } from './server/firebaseCredentials.js';
+import { roomIdentityFailure } from './server/roomIdentityFailure.js';
 
 
 // Railway-safe 101-pool rules. These are intentionally embedded in the
@@ -661,19 +662,29 @@ function rejoinOfferFor(game, playerId) {
 async function loadRejoinWallet() { return import('./server/rejoinWallet.js'); }
 
 function withWalletIdentity(socket, handler) {
-  return (payload = {}, ack) => {
+  return async (payload = {}, ack) => {
     if (!payload.idToken) {
       const player = rooms[normaliseCode(payload.code)]?.players.find(p => p.playerId === payload.playerId);
       if (player?.walletUid) { ack?.({ ok: false, message: 'Sign in again to restore this table.' }); return; }
       socket.walletUid = null;
       return handler(payload, ack);
     }
-    return loadRejoinWallet().then(wallet => wallet.verifyWalletIdentity(payload.idToken)).then(uid => {
-      const player = rooms[normaliseCode(payload.code)]?.players.find(p => p.playerId === payload.playerId);
-      if (player?.walletUid && player.walletUid !== uid) throw new Error('This table seat belongs to a different account.');
-      socket.walletUid = uid;
-      return handler(payload, ack);
-    }).catch(() => ack?.({ ok: false, message: 'Unable to verify your table identity. Please sign in again.' }));
+    let uid;
+    try {
+      const wallet = await loadRejoinWallet();
+      uid = await wallet.verifyWalletIdentity(payload.idToken);
+    } catch (error) {
+      console.warn('[Room identity]', /^[a-z/-]+$/i.test(String(error?.code || '')) ? error.code : 'verification-failed');
+      ack?.(roomIdentityFailure(error));
+      return;
+    }
+    const player = rooms[normaliseCode(payload.code)]?.players.find(p => p.playerId === payload.playerId);
+    if (player?.walletUid && player.walletUid !== uid) {
+      ack?.({ok:false,code:'ROOM_ACCOUNT_MISMATCH',message:'This table seat belongs to a different account. Use that account or leave the old table first.'});
+      return;
+    }
+    socket.walletUid = uid;
+    return handler(payload, ack);
   };
 }
 
@@ -2402,7 +2413,7 @@ function scheduleGameStart(code) {
 }
 
 app.get('/', (req, res) => {
-  res.json({ ok: true, service: 'Star Rummy multiplayer', version: '1.7.36', walletCredentialsConfigured:walletConfigurationStatus().configured, playBillingConfigured: billingConfigured(), playScoreLimit: 101, rejoinLockScore: 79, maxRejoins: 1, autoDropMissedTurns: autoDropThreshold(), rooms: Object.keys(rooms).length });
+  res.json({ ok: true, service: 'Star Rummy multiplayer', version: '1.7.38', walletCredentialsConfigured:walletConfigurationStatus().configured, playBillingConfigured: billingConfigured(), playScoreLimit: 101, rejoinLockScore: 79, maxRejoins: 1, autoDropMissedTurns: autoDropThreshold(), rooms: Object.keys(rooms).length });
 });
 
 io.on('connection', (socket) => {
