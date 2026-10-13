@@ -1,16 +1,16 @@
 // Platform token rules, not a universal 101 Pool scoring rule.
 export const DEFAULT_SPLIT_RULES = Object.freeze({ enabled:true, method:'drop_weighted', timeoutSeconds:30,
-  maxRequests:2, tableTypes:[6], minPlayers:3, feeBps:0, dropPenalty:20,
-  enableThreePlayer:true, enableTwoPlayer:true, autoPopup:false, manualButton:true, precision:0 })
+  maxRequests:2, tableTypes:[2,6], minPlayers:2, feeBps:0, dropPenalty:20,
+  enableThreePlayer:true, enableTwoPlayer:true, autoPopup:true, manualButton:true, precision:0 })
 
 export function normalizeSplitRules(value = {}) {
   const integer = (key, low, high) => Math.max(low, Math.min(high, Math.floor(Number(value[key] ?? DEFAULT_SPLIT_RULES[key]) || 0)))
   return { enabled:value.enabled !== false, method:value.method === 'equal' ? 'equal' : 'drop_weighted',
     timeoutSeconds:integer('timeoutSeconds',10,120), maxRequests:integer('maxRequests',1,10),
-    tableTypes:Array.isArray(value.tableTypes) ? [...new Set(value.tableTypes.filter(n => n === 2 || n === 6))] : [6],
+    tableTypes:Array.isArray(value.tableTypes) ? [...new Set(value.tableTypes.filter(n => n === 2 || n === 6))] : [...DEFAULT_SPLIT_RULES.tableTypes],
     minPlayers:integer('minPlayers',2,3), feeBps:integer('feeBps',0,10000), dropPenalty:integer('dropPenalty',1,80),
     enableThreePlayer:value.enableThreePlayer !== false, enableTwoPlayer:value.enableTwoPlayer !== false,
-    autoPopup:value.autoPopup === true, manualButton:value.manualButton !== false,
+    autoPopup:typeof value.autoPopup === 'boolean' ? value.autoPopup : DEFAULT_SPLIT_RULES.autoPopup, manualButton:value.manualButton !== false,
     // Existing wallets support whole tokens only. Do not introduce fractional balances.
     precision:0 }
 }
