@@ -1,5 +1,5 @@
 // Platform token rules, not a universal 101 Pool scoring rule.
-export const DEFAULT_SPLIT_RULES = Object.freeze({ enabled:true, method:'drop_weighted', timeoutSeconds:30,
+export const DEFAULT_SPLIT_RULES = Object.freeze({ enabled:true, method:'drop_weighted', timeoutSeconds:60,
   maxRequests:2, tableTypes:[2,6], minPlayers:2, feeBps:0, dropPenalty:20,
   enableThreePlayer:true, enableTwoPlayer:true, autoPopup:true, manualButton:true, precision:0 })
 

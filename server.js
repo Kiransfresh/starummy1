@@ -1165,6 +1165,7 @@ function scoreWindowRequiredPlayerIds(game) {
   }
   return game.players
     .filter((player) => player.playerId !== game.roundWinnerPlayerId)
+    .filter((player) => !player.hasLeft && !player.permanentlyDisconnected)
     .filter((player) => !game.declaredPlayerIds?.has(player.playerId))
     .filter((player) => !game.droppedPlayerIds.has(player.playerId))
     .filter((player) => !isEliminated(game, player.playerId))
@@ -1459,8 +1460,10 @@ function resumeAfterWrongShow(code, playerId, reason) {
 function finalizeScoreWindow(code) {
   const game = games[code];
   if (!game || game.state !== 'score_window') return;
-  // The shared declaration deadline is authoritative, even if everyone shows early.
-  if (game.scoreWindowStage === 'score' && Date.now() < game.scoreWindowEndsAt) return;
+  // The deadline is a maximum, not a mandatory wait after everyone submits.
+  const allSubmitted = game.scoreWindowStage === 'score'
+    && scoreWindowRequiredPlayerIds(game).every(id => game.submittedScorePlayerIds?.has(id));
+  if (game.scoreWindowStage === 'score' && !allSubmitted && Date.now() < game.scoreWindowEndsAt) return;
   if (game.scoreWindowTimer) {
     clearTimeout(game.scoreWindowTimer);
     game.scoreWindowTimer = null;
@@ -1519,15 +1522,19 @@ function emitDeclarationWindowState(code) {
     declaredPlayerIds: [...(game.declaredPlayerIds || new Set())],
     message: game.scoreWindowStage === 'declare'
       ? 'Finish confirmed. Arrange your 13 cards and press DECLARE SHOW before the 30-second timer reaches 0.'
-      : 'Declare only: pick, discard and drop are locked. Final scores appear after 30 seconds.',
+      : 'Arrange and declare only. Final scores appear when everyone finishes, or after 30 seconds.',
   });
 }
 
 function advanceScoreWindowTurn(code, fromIndex = null) {
   const game = games[code];
   if (!game || game.state !== 'score_window' || game.scoreWindowStage !== 'score') return;
-  // No turn exists during the declaration-only window. Never end it early.
+  // No normal turn exists during the declaration-only window.
   game.turnIndex = -1;
+  if (scoreWindowRequiredPlayerIds(game).every(id => game.submittedScorePlayerIds?.has(id))) {
+    finalizeScoreWindow(code);
+    return;
+  }
   broadcastGameState(code);
 }
 
@@ -1555,7 +1562,7 @@ function submitFollowingDeclaration(code, actor, cardId) {
     reason: verdict.reason, scoreWindow: true, stage: 'score', submitted: true,
     scoreWindowEndsAt: game.scoreWindowEndsAt, winnerPlayerId: game.roundWinnerPlayerId,
   };
-  // Subsequent shows keep the first winner and the original fixed deadline.
+  // Subsequent shows keep the first winner and the original maximum deadline.
   // A wrong show penalizes this player only and never cancels that window.
   advanceScoreWindowTurn(code, game.turnIndex);
   response.roundOver = game.state !== 'score_window';
@@ -1712,7 +1719,7 @@ function submitDeclarationShow(code, actor) {
     game.scoreWindowTimer = setTimeout(() => finalizeScoreWindow(code), SCORE_WINDOW_SECONDS * 1000);
     game.pendingRoundDetails = {
       reason: 'valid_declaration',
-      message: `${actor.name} made a valid declaration. Scores finalize when the 30-second timer reaches 0.`,
+      message: `${actor.name} made a valid declaration. Scores finalize when everyone finishes or the 30-second timer expires.`,
       declarerPlayerId: actor.playerId,
       validDeclaration: true,
       roundWinnerPlayerId: actor.playerId,
@@ -1911,7 +1918,7 @@ function removePlayerAfterGrace(code, playerId) {
       disconnectTimers.delete(key);
       removePlayerAfterGrace(code, playerId);
     }, Math.max(1, pendingGame.scoreWindowEndsAt - Date.now()) + ROUND_RESULT_SECONDS * 1000));
-    broadcastGameState(code);
+    advanceScoreWindowTurn(code);
     return;
   }
 
@@ -2413,7 +2420,7 @@ function scheduleGameStart(code) {
 }
 
 app.get('/', (req, res) => {
-  res.json({ ok: true, service: 'Star Rummy multiplayer', version: '1.7.39', walletCredentialsConfigured:walletConfigurationStatus().configured, playBillingConfigured: billingConfigured(), playScoreLimit: 101, rejoinLockScore: 79, maxRejoins: 1, autoDropMissedTurns: autoDropThreshold(), rooms: Object.keys(rooms).length });
+res.json({ ok: true, service: 'Star Rummy multiplayer', version: '1.7.41', walletCredentialsConfigured:walletConfigurationStatus().configured, playBillingConfigured: billingConfigured(), playScoreLimit: 101, rejoinLockScore: 79, maxRejoins: 1, autoDropMissedTurns: autoDropThreshold(), rooms: Object.keys(rooms).length });
 });
 
 io.on('connection', (socket) => {
