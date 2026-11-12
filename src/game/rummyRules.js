@@ -40,17 +40,18 @@ export function isJokerCard(card, wildJoker = null) {
   return isPrintedJoker(card) || isWildJoker(card, wildJoker)
 }
 
-export function canPickFromOpenPile(card, wildJoker = null, initialOpenJokerAvailable = false) {
-  // A discarded printed/wild joker stays visible in the open pile, but the
-  // next player must draw from the closed deck instead of picking that joker.
-  // The initially dealt face-up joker is the sole exception, before any draw.
-  return !!card && (initialOpenJokerAvailable === true || !isJokerCard(card, wildJoker))
+export function canPickFromOpenPile(card, wildJoker = null, allowInitialJoker = false) {
+  // Only the starting player may take the initially exposed joker on their
+  // first draw. Callers derive this permission from authoritative round state.
+  return !!card && (!isJokerCard(card, wildJoker) || allowInitialJoker === true)
 }
 
 export function getCardPoints(card, wildJoker = null) {
   if (!card || isJokerCard(card, wildJoker)) return 0
   if (HIGH_CARDS.has(String(card.rank))) return 10
-  return Math.max(0, Number(card.pts ?? card.value ?? card.rank) || 0)
+  // Rank, never a supplied/display points field, determines the penalty.
+  const rank = Number(card.rank)
+  return Number.isInteger(rank) && rank >= 2 && rank <= 9 ? rank : 0
 }
 
 function rankNumber(rank, aceHigh = false) {
@@ -312,6 +313,15 @@ export function validate101Declaration(hand, wildJoker = null) {
     return { valid: false, reason: 'A declaration must contain exactly 13 cards.' }
   }
 
+  const ids = hand.filter(card => card?.id != null).map(card => String(card.id))
+  if (new Set(ids).size !== ids.length) return { valid:false, reason:'Every physical card must be accounted for exactly once.' }
+  const copies = new Map()
+  for (const card of hand) {
+    const key = isPrintedJoker(card) ? 'printed' : `${card.rank}:${card.suit}`
+    copies.set(key, (copies.get(key) || 0) + 1)
+    if (copies.get(key) > (key === 'printed' ? 4 : 2)) return { valid:false, reason:'This hand contains more card copies than the two decks allow.' }
+  }
+
   const melds = enumerateMelds(hand, wildJoker)
   const byCard = buildMeldIndex(hand, melds)
   const fullMask = (1 << hand.length) - 1
@@ -412,6 +422,35 @@ export function calculate101Penalty(hand, wildJoker = null) {
   return Math.min(80, Math.max(0, totalPoints - protectedPoints))
 }
 
+export function calculateFirstCardPenalty(hand, wildJoker = null) {
+  const cards = Array.isArray(hand) ? hand.filter(Boolean) : [];
+  if (!cards.length) return 0;
+  const melds = enumerateMelds(cards, wildJoker);
+  if (!melds.length) {
+    const jokers = cards.filter((card) => isJokerCard(card, wildJoker)).length;
+    const rank = String(getWildJokerRank(wildJoker) || 'A');
+    const value = HIGH_CARDS.has(rank) ? 10 : Number(rank) || 0;
+    return Math.max(0, 40 - value / 2 * jokers);
+  }
+  const byCard = buildMeldIndex(cards, melds);
+  const points = cards.map((card) => getCardPoints(card, wildJoker));
+  const memo = new Map();
+  function covered(mask) {
+    if (!mask) return 0;
+    if (memo.has(mask)) return memo.get(mask);
+    let first = 0;
+    while ((mask & (1 << first)) === 0) first += 1;
+    let best = covered(mask ^ (1 << first));
+    for (const meld of byCard[first]) {
+      if ((meld.mask & mask) === meld.mask) best = Math.max(best, meld.coveredPoints + covered(mask ^ meld.mask));
+    }
+    memo.set(mask, best);
+    return best;
+  }
+  const total = points.reduce((sum, point) => sum + point, 0);
+  return Math.min(80, Math.max(0, total - covered((1 << cards.length) - 1)));
+}
+
 export const POOL_101 = Object.freeze({
   eliminationScore: 101,
   firstDrop: 20,
@@ -419,3 +458,7 @@ export const POOL_101 = Object.freeze({
   invalidDeclaration: 80,
   maxRoundPenalty: 80,
 })
+export function dealOrderAfterDealer(seatIds, dealerId) {
+  const firstSeat = seatIds.indexOf(dealerId) + 1
+  return [...seatIds.slice(firstSeat), ...seatIds.slice(0, firstSeat)]
+}

@@ -9,6 +9,7 @@ RUN npm install --omit=dev --no-audit --no-fund
 
 COPY server.js ./server.js
 COPY server ./server
+COPY src/game/rummyRules.js ./src/game/rummyRules.js
 
 EXPOSE 3000
 CMD ["node", "server.js"]

@@ -7,290 +7,18 @@ import { publicPagesRouter } from './server/publicPages.js';
 import { billingConfigured, verifyAndCreditPlayPurchase } from './server/playBilling.js';
 import { roomFundingFailure, walletConfigurationStatus } from './server/firebaseCredentials.js';
 import { roomIdentityFailure } from './server/roomIdentityFailure.js';
+import { isPrintedJoker as ruleIsPrintedJoker, isJokerCard as ruleIsJokerCard, calculateFirstCardPenalty, calculate101Penalty, validate101Declaration, selectWildJokerIndex, dealOrderAfterDealer } from './src/game/rummyRules.js';
 
-
-// Railway-safe 101-pool rules. These are intentionally embedded in the
-// socket server so the production backend does not depend on frontend src/
-// files being present in the Docker/GitHub build context.
-const RULE_HIGH_CARDS = new Set(['A', '10', 'J', 'Q', 'K']);
-
-function ruleIsPrintedJoker(card) {
-  return !!card && (
-    card.isJoker === true
-    || card.rank === 'JKR'
-    || card.suit === 'JOKER'
-    || card.suit === '🃏'
-  );
-}
-
-function ruleWildJokerRank(wildJoker = null) {
-  if (!wildJoker) return null;
-  return ruleIsPrintedJoker(wildJoker) ? 'A' : wildJoker.rank;
-}
-
-function ruleIsWildJoker(card, wildJoker = null) {
-  if (!card || ruleIsPrintedJoker(card)) return false;
-  const wildRank = ruleWildJokerRank(wildJoker);
-  // The current round indicator is authoritative. Never let an old display
-  // flag make the wrong rank a joker after a new 101 Pool deal starts.
-  if (wildRank) return String(card.rank) === String(wildRank);
-  return card.isWildJoker === true;
-}
-
-function ruleIsJokerCard(card, wildJoker = null) {
-  return ruleIsPrintedJoker(card) || ruleIsWildJoker(card, wildJoker);
-}
 
 function canTakeInitialOpenJoker(game, playerId) {
   const top = game.discardPile?.at(-1);
-  return game.state === 'playing' && game.initialOpenJokerAvailable === true
+  return acceptsTurnMoves(game) && game.initialOpenJokerAvailable === true
     && game.drawnPlayerIds?.size === 0 && game.initialOpenJokerPlayerId === playerId
     && game.players[game.turnIndex]?.playerId === playerId
     && top?.id === game.initialOpenCardId;
 }
 
-function ruleCardPoints(card, wildJoker = null) {
-  if (!card || ruleIsJokerCard(card, wildJoker)) return 0;
-  if (RULE_HIGH_CARDS.has(String(card.rank))) return 10;
-  const rank = Number(card.rank);
-  return Number.isInteger(rank) && rank >= 2 && rank <= 9 ? rank : 0;
-}
 
-function ruleRankNumber(rank, aceHigh = false) {
-  if (rank === 'A') return aceHigh ? 14 : 1;
-  if (rank === 'J') return 11;
-  if (rank === 'Q') return 12;
-  if (rank === 'K') return 13;
-  return Number(rank) || 0;
-}
-
-function ruleCanFormSequence(naturals, jokerCount) {
-  if (!naturals.length) return false;
-  if (new Set(naturals.map((card) => card.suit)).size !== 1) return false;
-
-  const groupSize = naturals.length + jokerCount;
-  if (groupSize < 3 || groupSize > 13) return false;
-
-  for (const aceHigh of [false, true]) {
-    const ranks = naturals
-      .map((card) => ruleRankNumber(card.rank, aceHigh))
-      .sort((a, b) => a - b);
-    if (ranks.some((rank) => rank < 1 || rank > 14)) continue;
-    if (new Set(ranks).size !== ranks.length) continue;
-
-    const minRank = ranks[0];
-    const maxRank = ranks[ranks.length - 1];
-    const earliestStart = Math.max(1, maxRank - groupSize + 1);
-    const latestStart = Math.min(minRank, 15 - groupSize);
-    if (earliestStart <= latestStart) return true;
-  }
-
-  return false;
-}
-
-function ruleEvaluateMeld(cards, wildJoker = null) {
-  const group = Array.isArray(cards) ? cards.filter(Boolean) : [];
-  if (group.length < 3) return null;
-
-  const printed = group.filter(ruleIsPrintedJoker);
-  const wild = group.filter((card) => ruleIsWildJoker(card, wildJoker));
-  const jokers = [...printed, ...wild];
-  const naturals = group.filter(
-    (card) => !ruleIsPrintedJoker(card) && !ruleIsWildJoker(card, wildJoker),
-  );
-
-  if (printed.length === 0 && ruleCanFormSequence([...naturals, ...wild], 0)) {
-    return { type: 'pure_sequence', sequence: true, pure: true };
-  }
-
-  if (naturals.length > 0 && ruleCanFormSequence(naturals, jokers.length)) {
-    return { type: 'sequence', sequence: true, pure: false };
-  }
-
-  if (group.length <= 4 && naturals.length > 0) {
-    const ranks = new Set(naturals.map((card) => card.rank));
-    const suits = new Set(naturals.map((card) => card.suit));
-    if (ranks.size === 1 && suits.size === naturals.length) {
-      return { type: 'set', sequence: false, pure: false };
-    }
-  }
-
-  return null;
-}
-
-function ruleEnumerateMelds(hand, wildJoker = null) {
-  const melds = [];
-  const limit = 1 << hand.length;
-  const points = hand.map((card) => ruleCardPoints(card, wildJoker));
-
-  for (let mask = 1; mask < limit; mask += 1) {
-    const cards = [];
-    let count = 0;
-    let coveredPoints = 0;
-    for (let index = 0; index < hand.length; index += 1) {
-      if ((mask & (1 << index)) === 0) continue;
-      count += 1;
-      cards.push(hand[index]);
-      coveredPoints += points[index];
-    }
-    if (count < 3) continue;
-    const evaluation = ruleEvaluateMeld(cards, wildJoker);
-    if (evaluation) melds.push({ mask, coveredPoints, ...evaluation });
-  }
-
-  return melds;
-}
-
-function ruleBuildMeldIndex(hand, melds) {
-  const byCard = Array.from({ length: hand.length }, () => []);
-  for (const meld of melds) {
-    for (let index = 0; index < hand.length; index += 1) {
-      if (meld.mask & (1 << index)) byCard[index].push(meld);
-    }
-  }
-  return byCard;
-}
-
-function validate101Declaration(hand, wildJoker = null) {
-  if (!Array.isArray(hand) || hand.length !== 13) {
-    return { valid: false, reason: 'A declaration must contain exactly 13 cards.' };
-  }
-
-  const ids = hand.filter(card => card?.id != null).map(card => String(card.id));
-  if (new Set(ids).size !== ids.length) return { valid: false, reason: 'Every physical card must be accounted for exactly once.' };
-  const copies = new Map();
-  for (const card of hand) {
-    const key = ruleIsPrintedJoker(card) ? 'printed' : `${card.rank}:${card.suit}`;
-    copies.set(key, (copies.get(key) || 0) + 1);
-    if (copies.get(key) > (key === 'printed' ? 4 : 2)) return { valid: false, reason: 'This hand contains more card copies than the two decks allow.' };
-  }
-
-  const melds = ruleEnumerateMelds(hand, wildJoker);
-  const byCard = ruleBuildMeldIndex(hand, melds);
-  const fullMask = (1 << hand.length) - 1;
-  const memo = new Map();
-
-  function search(remainingMask, sequenceCount, hasPureSequence) {
-    if (remainingMask === 0) return sequenceCount >= 2 && hasPureSequence;
-    const key = `${remainingMask}:${Math.min(sequenceCount, 2)}:${hasPureSequence ? 1 : 0}`;
-    if (memo.has(key)) return memo.get(key);
-
-    let first = 0;
-    while ((remainingMask & (1 << first)) === 0) first += 1;
-    for (const meld of byCard[first]) {
-      if ((meld.mask & remainingMask) !== meld.mask) continue;
-      if (search(
-        remainingMask ^ meld.mask,
-        Math.min(2, sequenceCount + (meld.sequence ? 1 : 0)),
-        hasPureSequence || meld.pure,
-      )) {
-        memo.set(key, true);
-        return true;
-      }
-    }
-
-    memo.set(key, false);
-    return false;
-  }
-
-  const valid = search(fullMask, 0, false);
-  return {
-    valid,
-    reason: valid
-      ? ''
-      : 'Need two sequences, including one pure sequence, with every card in a valid meld.',
-  };
-}
-
-function calculate101Penalty(hand, wildJoker = null) {
-  const cards = Array.isArray(hand) ? hand.filter(Boolean) : [];
-  if (!cards.length) return 0;
-
-  const points = cards.map((card) => ruleCardPoints(card, wildJoker));
-  const totalPoints = points.reduce((sum, point) => sum + point, 0);
-  const melds = ruleEnumerateMelds(cards, wildJoker);
-  const byCard = ruleBuildMeldIndex(cards, melds);
-  const fullMask = (1 << cards.length) - 1;
-
-  const pureMemo = new Map();
-  function bestPureCoverage(mask) {
-    if (mask === 0) return 0;
-    if (pureMemo.has(mask)) return pureMemo.get(mask);
-    let first = 0;
-    while ((mask & (1 << first)) === 0) first += 1;
-    let best = bestPureCoverage(mask ^ (1 << first));
-    for (const meld of byCard[first]) {
-      if (!meld.pure || (meld.mask & mask) !== meld.mask) continue;
-      best = Math.max(best, meld.coveredPoints + bestPureCoverage(mask ^ meld.mask));
-    }
-    pureMemo.set(mask, best);
-    return best;
-  }
-
-  const fullMemo = new Map();
-  function bestFullCoverage(mask, sequenceCount, hasPureSequence) {
-    if (mask === 0) {
-      return sequenceCount >= 2 && hasPureSequence ? 0 : Number.NEGATIVE_INFINITY;
-    }
-    const key = `${mask}:${Math.min(sequenceCount, 2)}:${hasPureSequence ? 1 : 0}`;
-    if (fullMemo.has(key)) return fullMemo.get(key);
-
-    let first = 0;
-    while ((mask & (1 << first)) === 0) first += 1;
-    let best = bestFullCoverage(mask ^ (1 << first), sequenceCount, hasPureSequence);
-    for (const meld of byCard[first]) {
-      if ((meld.mask & mask) !== meld.mask) continue;
-      const tail = bestFullCoverage(
-        mask ^ meld.mask,
-        Math.min(2, sequenceCount + (meld.sequence ? 1 : 0)),
-        hasPureSequence || meld.pure,
-      );
-      if (Number.isFinite(tail)) best = Math.max(best, meld.coveredPoints + tail);
-    }
-    fullMemo.set(key, best);
-    return best;
-  }
-
-  const pureCoverage = bestPureCoverage(fullMask);
-  const fullCoverage = bestFullCoverage(fullMask, 0, false);
-  const protectedPoints = Math.max(
-    pureCoverage,
-    Number.isFinite(fullCoverage) ? fullCoverage : 0,
-  );
-  return Math.min(80, Math.max(0, totalPoints - protectedPoints));
-}
-
-// A valid show made before anyone draws is a special 101 Pool opening show.
-// Protect independently valid melds and score their unmatched cards normally.
-// Only a no-meld hand uses 40 minus half the wild rank's normal card value.
-function calculateFirstCardPenalty(hand, wildJoker = null) {
-  const cards = Array.isArray(hand) ? hand.filter(Boolean) : [];
-  if (!cards.length) return 0;
-  const melds = ruleEnumerateMelds(cards, wildJoker);
-  if (!melds.length) {
-    const jokers = cards.filter((card) => ruleIsJokerCard(card, wildJoker)).length;
-    const rank = String(ruleWildJokerRank(wildJoker) || 'A');
-    const value = RULE_HIGH_CARDS.has(rank) ? 10 : Number(rank) || 0;
-    return Math.max(0, 40 - value / 2 * jokers);
-  }
-  const byCard = ruleBuildMeldIndex(cards, melds);
-  const points = cards.map((card) => ruleCardPoints(card, wildJoker));
-  const memo = new Map();
-  function covered(mask) {
-    if (!mask) return 0;
-    if (memo.has(mask)) return memo.get(mask);
-    let first = 0;
-    while ((mask & (1 << first)) === 0) first += 1;
-    let best = covered(mask ^ (1 << first));
-    for (const meld of byCard[first]) {
-      if ((meld.mask & mask) === meld.mask) best = Math.max(best, meld.coveredPoints + covered(mask ^ meld.mask));
-    }
-    memo.set(mask, best);
-    return best;
-  }
-  const total = points.reduce((sum, point) => sum + point, 0);
-  return Math.min(80, Math.max(0, total - covered((1 << cards.length) - 1)));
-}
 const app = express();
 app.use(publicPagesRouter());
 const httpServer = createServer(app);
@@ -470,97 +198,6 @@ function finalizeAutomaticSeating(room) {
   return room.players;
 }
 
-function selectWildJokerIndex(cards = [], random = Math.random) {
-  if (!Array.isArray(cards) || cards.length === 0) return -1;
-  const eligible = [];
-  for (let index = 0; index < cards.length; index += 1) {
-    const card = cards[index];
-    if (ruleIsPrintedJoker(card) || RANKS.includes(String(card?.rank))) eligible.push(index);
-  }
-  if (eligible.length === 0) return -1;
-  const roll = Number(random?.());
-  const safeRoll = Number.isFinite(roll) ? Math.min(.999999999, Math.max(0, roll)) : 0;
-  return eligible[Math.floor(safeRoll * eligible.length)];
-}
-
-function isWild(card, wildJoker) {
-  if (!card || ruleIsPrintedJoker(card)) return false;
-  const wildRank = ruleWildJokerRank(wildJoker);
-  return !!wildRank && card.rank === wildRank;
-}
-
-function cardPoints(card, wildJoker) {
-  if (!card || isWild(card, wildJoker)) return 0;
-  if (['A', '10', 'J', 'Q', 'K'].includes(card.rank)) return 10;
-  return Math.max(0, Number(card.rank) || 0);
-}
-
-function rankValue(rank) {
-  if (rank === 'A') return 1;
-  if (rank === 'J') return 11;
-  if (rank === 'Q') return 12;
-  if (rank === 'K') return 13;
-  return Number(rank) || 0;
-}
-
-function isSequence(cards, jokerCount) {
-  if (cards.length === 0) return false;
-  if (new Set(cards.map((card) => card.suit)).size !== 1) return false;
-
-  const ranks = cards.map((card) => rankValue(card.rank)).sort((a, b) => a - b);
-  if (ranks.some((rank) => rank < 1 || rank > 13)) return false;
-  if (new Set(ranks).size !== ranks.length) return false;
-
-  const groupSize = cards.length + jokerCount;
-  const minRank = ranks[0];
-  const maxRank = ranks[ranks.length - 1];
-  const earliestStart = Math.max(1, maxRank - groupSize + 1);
-  const latestStart = Math.min(minRank, 14 - groupSize);
-  return earliestStart <= latestStart;
-}
-
-function evaluateMeld(cards, wildJoker) {
-  if (!Array.isArray(cards) || cards.length < 3) return null;
-  const jokers = cards.filter((card) => isWild(card, wildJoker));
-  const naturals = cards.filter((card) => !isWild(card, wildJoker));
-
-  if (jokers.length === 0 && isSequence(naturals, 0)) {
-    return { type: 'pure_sequence', sequence: true, pure: true };
-  }
-
-  if (naturals.length > 0 && isSequence(naturals, jokers.length)) {
-    return { type: 'sequence', sequence: true, pure: false };
-  }
-
-  if (cards.length <= 4 && naturals.length > 0) {
-    const ranks = new Set(naturals.map((card) => card.rank));
-    const suits = new Set(naturals.map((card) => card.suit));
-    if (ranks.size === 1 && suits.size === naturals.length) {
-      return { type: 'set', sequence: false, pure: false };
-    }
-  }
-
-  return null;
-}
-
-function enumerateMelds(hand, wildJoker) {
-  const melds = [];
-  const limit = 1 << hand.length;
-  for (let mask = 1; mask < limit; mask += 1) {
-    let count = 0;
-    const cards = [];
-    for (let index = 0; index < hand.length; index += 1) {
-      if ((mask & (1 << index)) === 0) continue;
-      count += 1;
-      cards.push(hand[index]);
-    }
-    if (count < 3) continue;
-    const evaluation = evaluateMeld(cards, wildJoker);
-    if (evaluation) melds.push({ mask, cards, ...evaluation });
-  }
-  return melds;
-}
-
 function validateDeclaration(hand, wildJoker) {
   return validate101Declaration(hand, wildJoker);
 }
@@ -586,7 +223,7 @@ function isRoundActive(game, player) {
 }
 
 function acceptsTurnMoves(game) {
-  return game?.state === 'playing';
+  return game?.state === 'playing' && (!game.roundDeal || Date.now() >= game.roundDeal.playAt);
 }
 
 // Seat order is clockwise around the table. Moving +1 therefore moves to the
@@ -857,8 +494,8 @@ function addPoints(game, playerId, points) {
   game.scoredPlayerIds ||= new Set();
   if (game.scoredPlayerIds.has(playerId)) return false;
   const safePoints = Math.max(0, Math.min(80, Number(points) || 0));
-  game.scoresByPlayerId[playerId] = (game.scoresByPlayerId[playerId] || 0) + safePoints;
-  game.roundPointsByPlayerId[playerId] = (game.roundPointsByPlayerId[playerId] || 0) + safePoints;
+  game.scoresByPlayerId[playerId] = (Number(game.scoresByPlayerId[playerId]) || 0) + safePoints;
+  game.roundPointsByPlayerId[playerId] = (Number(game.roundPointsByPlayerId[playerId]) || 0) + safePoints;
   game.scoredPlayerIds.add(playerId);
   return true;
 }
@@ -877,7 +514,7 @@ function dropOfferFor(game, playerId) {
   const penalty = hasDrawn ? 40 : 20;
   const handSize = game.handsByPlayerId[playerId]?.length || 0;
   return {
-    allowed: game.state === 'playing' && game.players[game.turnIndex]?.playerId === playerId
+    allowed: acceptsTurnMoves(game) && game.players[game.turnIndex]?.playerId === playerId
       && isRoundActive(game, player) && !game.scoredPlayerIds?.has(playerId) && [13, 14].includes(handSize),
     roundNumber: game.roundNumber, currentScore, penalty,
     type: hasDrawn ? 'Middle drop' : 'First drop',
@@ -941,7 +578,7 @@ function noteMissedTurn(code, game, turnId) {
 
 function syncDropTurnClock(code, game) {
   const actor = game.players[game.turnIndex];
-  if (game.state !== 'playing' || !isRoundActive(game, actor)) {
+  if (!acceptsTurnMoves(game) || !isRoundActive(game, actor)) {
     clearDropTurnClock(game);
     return;
   }
@@ -975,6 +612,9 @@ function validateDropTurnRequest(code, game, payload) {
 
 function dealRound(game, incrementRound = true) {
   clearDropTurnClock(game);
+  if (game.roundDealTimer) clearTimeout(game.roundDealTimer);
+  game.roundDealTimer = null;
+  game.roundDeal = null;
   game.missedTurnsByPlayerId = {};
   if (game.nextRoundTimer) {
     clearTimeout(game.nextRoundTimer);
@@ -995,7 +635,7 @@ function dealRound(game, incrementRound = true) {
   }
   const deck = shuffle(buildTwoDecks());
   const handsByPlayerId = Object.fromEntries(game.players.map((player) => [player.playerId, []]));
-  const activePlayers = game.players.filter(player => game.roundParticipantPlayerIds.includes(player.playerId));
+  const activePlayers = initialDealOrder(game);
   let cursor = 0;
 
   // Real-table style distribution: one card per active seat per pass instead
@@ -1213,6 +853,7 @@ function buildSnapshot(game, forPlayerId) {
     currentTurnPlayerId: current?.playerId ?? null,
     state: game.state,
     roundNumber: game.roundNumber || 1,
+    roundDeal: game.roundDeal && Date.now() < game.roundDeal.playAt ? game.roundDeal : null,
     dealerIndex: game.dealerIndex ?? 0,
     dealerPlayerId: game.players[game.dealerIndex]?.playerId || null,
     crownPlayerId: game.crownPlayerId || null,
@@ -1242,7 +883,7 @@ function buildSnapshot(game, forPlayerId) {
     requiredScorePlayerIds: scoreWindowRequiredPlayerIds(game),
     submittedScorePlayerIds: [...(game.submittedScorePlayerIds || new Set())],
     declaredPlayerIds: [...(game.declaredPlayerIds || new Set())],
-    firstCardDeclarationAvailable: game.state === 'playing' && game.drawnPlayerIds?.size === 0,
+    firstCardDeclarationAvailable: acceptsTurnMoves(game) && game.drawnPlayerIds?.size === 0,
     canPickInitialOpenJoker: canTakeInitialOpenJoker(game, forPlayerId),
     rejoinCandidatePlayerIds: game.state === 'round_over' ? [...(game.rejoinCandidatePlayerIds || [])] : [],
     rejoinStartingScore: game.state === 'round_over' && game.rejoinCandidatePlayerIds?.length ? rejoinStartingScore(game) : null,
@@ -1281,6 +922,32 @@ function broadcastGameState(code) {
   maybeAutoSplit(code, game);
   if (game.state === 'finished' && game.winnerPlayerId && !game.splitFinalized && !game.poolSettled && !game.settlementPending && !game.settlementError) void settleWinner(code);
   for (const player of game.players) sendGameStateToPlayer(code, player);
+}
+
+function startNextRoomDeal(code, game) {
+  dealRound(game);
+  if (game.state !== 'playing') {
+    broadcastGameState(code);
+    return;
+  }
+  const dealOrderPlayerIds = initialDealOrder(game).map(player => player.playerId);
+  const startedAt = Date.now();
+  const cardGapMs = 50;
+  const cardFlightMs = 280;
+  const dealStartDelayMs = INITIAL_DECK_SETUP_MS;
+  const dealCardsDurationMs = (dealOrderPlayerIds.length * 13 - 1) * cardGapMs + cardFlightMs + 120;
+  const endsAt = startedAt + dealStartDelayMs + dealCardsDurationMs;
+  const playAt = endsAt + 3000;
+  const roundDeal = { startedAt, endsAt, playAt, cardGapMs, cardFlightMs, dealStartDelayMs, dealCardsDurationMs, dealOrderPlayerIds };
+  game.roundDeal = roundDeal;
+  game.roundDealTimer = setTimeout(() => {
+    if (games[code] !== game || game.roundDeal !== roundDeal) return;
+    game.roundDealTimer = null;
+    game.roundDeal = null;
+    broadcastGameState(code);
+  }, playAt - startedAt);
+  io.to(code).emit('round_started', { code, roundNumber: game.roundNumber });
+  broadcastGameState(code);
 }
 
 function buildRoundResult(code, game, forPlayerId, details = {}) {
@@ -1418,9 +1085,7 @@ function finishRound(code, details = {}) {
         broadcastGameState(code);
         return;
       }
-      dealRound(current);
-      io.to(code).emit('round_started', { code, roundNumber: current.roundNumber });
-      broadcastGameState(code);
+      startNextRoomDeal(code, current);
     };
     game.nextRoundTimer = setTimeout(advanceAfterResults, ROUND_RESULT_SECONDS * 1000);
   }
@@ -2104,15 +1769,10 @@ function makeInitialGame(currentRoom, players) {
 
 function initialDealOrder(game) {
   const active = game.players.filter(player => game.roundParticipantPlayerIds?.includes(player.playerId));
-  if (!active.length) return [];
+  const playersById = new Map(active.map(player => [player.playerId, player]));
   const dealerPlayerId = game.players[game.dealerIndex]?.playerId;
-  const dealerActiveIndex = active.findIndex((player) => player.playerId === dealerPlayerId);
-  const start = dealerActiveIndex >= 0 ? dealerActiveIndex : active.length - 1;
-  const ordered = [];
-  for (let offset = 1; offset <= active.length; offset += 1) {
-    ordered.push(active[(start + offset) % active.length]);
-  }
-  return ordered;
+  return dealOrderAfterDealer(active.map(player => player.playerId), dealerPlayerId)
+    .map(playerId => playersById.get(playerId));
 }
 
 function buildInitialDealPayload(code, game, playerId, common = {}) {
@@ -2120,6 +1780,8 @@ function buildInitialDealPayload(code, game, playerId, common = {}) {
   return {
     code,
     phase: 'initial_deal',
+    roundNumber: game.roundNumber,
+    serverNow: Date.now(),
     players: publicPlayers(game.players),
     seatingDraw: game.seatingDraw || [],
     highCardPlayerId: game.highCardPlayerId || null,
@@ -2131,11 +1793,12 @@ function buildInitialDealPayload(code, game, playerId, common = {}) {
     dealOrderPlayerIds: order.map((player) => player.playerId),
     cardsPerPlayer: 13,
     cardFlightMs: INITIAL_DEAL_FLIGHT_MS,
-    cardGapMs: INITIAL_DEAL_GAP_MS,
+    cardGapMs: order.length >= 5 ? 82 : INITIAL_DEAL_GAP_MS,
     deckSize: game.deck.length,
     openCard: game.discardPile[game.discardPile.length - 1] || null,
     wildJoker: game.wildJoker || null,
     hand: [...(game.handsByPlayerId[playerId] || [])],
+    ...game.initialDealTiming,
     ...common,
   };
 }
@@ -2343,11 +2006,12 @@ function scheduleGameStart(code) {
     // every visual card-flight has completed on all clients.
     game.state = 'initial_deal';
     const order = initialDealOrder(game);
+    const cardGapMs = order.length >= 5 ? 82 : INITIAL_DEAL_GAP_MS;
     const totalCards = order.length * 13;
     const startedAt = Date.now();
     const dealCardsDurationMs = Math.max(
       INITIAL_DEAL_FLIGHT_MS,
-      Math.max(0, totalCards - 1) * INITIAL_DEAL_GAP_MS + INITIAL_DEAL_FLIGHT_MS + 160,
+      Math.max(0, totalCards - 1) * cardGapMs + INITIAL_DEAL_FLIGHT_MS + 160,
     );
     // Match the reference table flow: settle the closed deck, open card and joker
     // first, then begin the visible 13-card round-robin deal. Gameplay stays locked
@@ -2361,6 +2025,7 @@ function scheduleGameStart(code) {
       deckSetupMs: INITIAL_DECK_SETUP_MS,
       dealStartDelayMs: INITIAL_DECK_SETUP_MS,
     };
+    game.initialDealTiming = common;
     const finalSeatingDraw = seatingDrawPayload(game.players);
 
     storeStartSequence(currentRoom, 'initial_deal', {
@@ -2371,7 +2036,7 @@ function scheduleGameStart(code) {
       dealerPlayerId: game.players[game.dealerIndex]?.playerId || null,
       dealOrderPlayerIds: order.map((player) => player.playerId),
       cardFlightMs: INITIAL_DEAL_FLIGHT_MS,
-      cardGapMs: INITIAL_DEAL_GAP_MS,
+      cardGapMs,
       deckSize: game.deck.length,
       openCard: game.discardPile[game.discardPile.length - 1] || null,
       wildJoker: game.wildJoker || null,
@@ -2420,7 +2085,7 @@ function scheduleGameStart(code) {
 }
 
 app.get('/', (req, res) => {
-res.json({ ok: true, service: 'Star Rummy multiplayer', version: '1.7.41', walletCredentialsConfigured:walletConfigurationStatus().configured, playBillingConfigured: billingConfigured(), playScoreLimit: 101, rejoinLockScore: 79, maxRejoins: 1, autoDropMissedTurns: autoDropThreshold(), rooms: Object.keys(rooms).length });
+res.json({ ok: true, service: 'Star Rummy multiplayer', version: '1.7.50', walletCredentialsConfigured:walletConfigurationStatus().configured, playBillingConfigured: billingConfigured(), playScoreLimit: 101, rejoinLockScore: 79, maxRejoins: 1, autoDropMissedTurns: autoDropThreshold(), rooms: Object.keys(rooms).length });
 });
 
 io.on('connection', (socket) => {
@@ -3121,9 +2786,7 @@ io.on('connection', (socket) => {
       clearTimeout(game.nextRoundTimer);
       game.nextRoundTimer = null;
     }
-    dealRound(game);
-    io.to(code).emit('round_started', { code, roundNumber: game.roundNumber });
-    broadcastGameState(code);
+    startNextRoomDeal(code, game);
     ack?.({ ok: true, code, roundNumber: game.roundNumber });
   });
 
