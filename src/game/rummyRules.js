@@ -451,6 +451,22 @@ export function calculateFirstCardPenalty(hand, wildJoker = null) {
   return Math.min(80, Math.max(0, total - covered((1 << cards.length) - 1)));
 }
 
+export function scoreUndeclaredHand(hand, wildJoker, firstCardDeclaration) {
+  const scoreHand = firstCardDeclaration ? calculateFirstCardPenalty : calculate101Penalty
+  return scoreHand(hand, wildJoker)
+}
+
+export function refillTablePiles(deck, discardPile, shuffle) {
+  if (!discardPile.length && deck.length) {
+    const shuffled = shuffle(deck)
+    return { deck: shuffled.slice(1), discardPile: shuffled.slice(0, 1) }
+  }
+  if (!deck.length && discardPile.length > 1) {
+    return { deck: shuffle(discardPile.slice(0, -1)), discardPile: discardPile.slice(-1) }
+  }
+  return null
+}
+
 export const POOL_101 = Object.freeze({
   eliminationScore: 101,
   firstDrop: 20,

@@ -7,7 +7,7 @@ import { publicPagesRouter } from './server/publicPages.js';
 import { billingConfigured, verifyAndCreditPlayPurchase } from './server/playBilling.js';
 import { roomFundingFailure, walletConfigurationStatus } from './server/firebaseCredentials.js';
 import { roomIdentityFailure } from './server/roomIdentityFailure.js';
-import { isPrintedJoker as ruleIsPrintedJoker, isJokerCard as ruleIsJokerCard, calculateFirstCardPenalty, calculate101Penalty, validate101Declaration, selectWildJokerIndex, dealOrderAfterDealer } from './src/game/rummyRules.js';
+import { isPrintedJoker as ruleIsPrintedJoker, isJokerCard as ruleIsJokerCard, validate101Declaration, selectWildJokerIndex, dealOrderAfterDealer, scoreUndeclaredHand, refillTablePiles } from './src/game/rummyRules.js';
 
 
 function canTakeInitialOpenJoker(game, playerId) {
@@ -200,10 +200,6 @@ function finalizeAutomaticSeating(room) {
 
 function validateDeclaration(hand, wildJoker) {
   return validate101Declaration(hand, wildJoker);
-}
-
-function calculateDeadwood(hand, wildJoker) {
-  return calculate101Penalty(hand, wildJoker);
 }
 
 function isEliminated(game, playerId) {
@@ -918,6 +914,10 @@ function sendLatestRoundResult(code, player) {
 function broadcastGameState(code) {
   const game = games[code];
   if (!game) return;
+  if (acceptsTurnMoves(game)) {
+    const piles = refillTablePiles(game.deck, game.discardPile, shuffle);
+    if (piles) Object.assign(game, piles);
+  }
   syncDropTurnClock(code, game);
   maybeAutoSplit(code, game);
   if (game.state === 'finished' && game.winnerPlayerId && !game.splitFinalized && !game.poolSettled && !game.settlementPending && !game.settlementError) void settleWinner(code);
@@ -1151,10 +1151,9 @@ function finalizeScoreWindow(code) {
     if (game.droppedPlayerIds.has(player.playerId)) continue; // drop/wrong-show penalty already recorded
     if (isEliminated(game, player.playerId)) continue;
     const submitted = game.pendingScoreSubmissions?.[player.playerId];
-    const score = Number.isFinite(submitted)
-      ? submitted
-      : game.firstCardDeclaration ? calculateFirstCardPenalty(game.handsByPlayerId[player.playerId] || [], game.wildJoker)
-        : calculateDeadwood(game.handsByPlayerId[player.playerId] || [], game.wildJoker);
+    const score = Number.isFinite(submitted) ? submitted : scoreUndeclaredHand(
+      game.handsByPlayerId[player.playerId], game.wildJoker, game.firstCardDeclaration,
+    );
     addPoints(game, player.playerId, score);
   }
 
@@ -2085,7 +2084,7 @@ function scheduleGameStart(code) {
 }
 
 app.get('/', (req, res) => {
-res.json({ ok: true, service: 'Star Rummy multiplayer', version: '1.7.50', walletCredentialsConfigured:walletConfigurationStatus().configured, playBillingConfigured: billingConfigured(), playScoreLimit: 101, rejoinLockScore: 79, maxRejoins: 1, autoDropMissedTurns: autoDropThreshold(), rooms: Object.keys(rooms).length });
+res.json({ ok: true, service: 'Star Rummy multiplayer', version: '1.7.51', walletCredentialsConfigured:walletConfigurationStatus().configured, playBillingConfigured: billingConfigured(), playScoreLimit: 101, rejoinLockScore: 79, maxRejoins: 1, autoDropMissedTurns: autoDropThreshold(), rooms: Object.keys(rooms).length });
 });
 
 io.on('connection', (socket) => {
